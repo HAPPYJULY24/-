@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+app_run.log
+
+# Exported Data
+exported_data/*.csv
+exported_data/*.xlsx
+
+# PyInstaller
+*.spec
+build/
+dist/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary Documentation (keep only README.md and PYINSTALLER_GUIDE.md)
+BUG_FIX_CRASH.md
+FUTURES_UPGRADE_SUMMARY.md
+THEME_FIX.md
