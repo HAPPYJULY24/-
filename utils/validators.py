@@ -39,7 +39,7 @@ def validate_code(code: str, asset_type: str) -> tuple[bool, str]:
     elif asset_type == "Futures - Global":
         # 修改：期货代码允许等号、减号、点号（例如：GC=F, CL=F, ES-MAR23）
         import re
-        if not re.match(r'^[A-Za-z0-9=\-.]+$', code):
+        if not re.match(r'^[A-Za-z0-9=\-.^]+$', code):
             return False, "期货代码格式错误！\n\n请输入有效的期货代码\n例如：GC=F（黄金）, CL=F（原油）, SI=F（白银）"
     
     elif asset_type == "Crypto":
@@ -73,9 +73,7 @@ def validate_date_range(start_date: datetime, end_date: datetime) -> tuple[bool,
     if start_date > now:
         return False, "开始日期不能晚于当前日期"
 
-    # 检查日期范围是否过大（超过2年）
-    delta = end_date - start_date
-    if delta.days > 730:  # 约2年
-        return False, "日期范围过大！\n\n建议选择不超过2年的数据范围。\n\n当前范围：{} 天".format(delta.days)
+    # 🆕 v2.0: 日期范围限制已移除，允许下载任意长度的历史数据
+    # 建议使用"增量更新"功能来高效管理长期数据
     
     return True, ""
