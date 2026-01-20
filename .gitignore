@@ -38,7 +38,15 @@ app_run.log
 
 # Exported Data
 exported_data/*.csv
+exported_data/*.parquet
 exported_data/*.xlsx
+
+# 🆕 v2.0: Master DB (用户数据，不提交到仓库)
+data/
+data/store/*.parquet
+
+# 🆕 用户配置(不提交)
+config/
 
 # PyInstaller
 *.spec

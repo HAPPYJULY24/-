@@ -21,9 +21,10 @@ class FetchWorker(QThread):
     
     def __init__(self, asset_type: str, code: str, timeframe: str, 
                  start_date: datetime, end_date: datetime,
-                 exchange: str = None, proxy_url: str = None):  # 新增参数
+                 exchange: str = None, proxy_url: str = None,
+                 use_smart_update: bool = False, filter_lunch: bool = False):  # 🆕 v2.0
         """
-        Initialize worker with fetch parameters.
+        Initialize worker with fetch parameters (v2.0 - 支持增量更新和午休过滤)
         
         Args:
             asset_type: Type of asset
@@ -31,8 +32,10 @@ class FetchWorker(QThread):
             timeframe: Time granularity
             start_date: Start date
             end_date: End date
-            exchange: Exchange name for crypto (新增)
-            proxy_url: Proxy URL if enabled (新增)
+            exchange: Exchange name for crypto
+            proxy_url: Proxy URL if enabled
+            use_smart_update: 启用增量更新 (v2.0)
+            filter_lunch: 过滤午休时段 (v2.0)
         """
         super().__init__()
         self.asset_type = asset_type
@@ -40,8 +43,10 @@ class FetchWorker(QThread):
         self.timeframe = timeframe
         self.start_date = start_date
         self.end_date = end_date
-        self.exchange = exchange  # 新增
-        self.proxy_url = proxy_url  # 新增
+        self.exchange = exchange
+        self.proxy_url = proxy_url
+        self.use_smart_update = use_smart_update  # 🆕 v2.0
+        self.filter_lunch = filter_lunch  # 🆕 v2.0
         self.fetcher = DataFetcher()
     
     def run(self):
@@ -54,17 +59,34 @@ class FetchWorker(QThread):
             print(f"[DEBUG] Asset: {self.asset_type}, Code: {self.code}, Timeframe: {self.timeframe}")
             print(f"[DEBUG] Date range: {self.start_date} to {self.end_date}")
             
-            # Fetch data
-            print("[DEBUG] Step 1: Starting data fetch...")
-            df = self.fetcher.fetch_data(
-                self.asset_type,
-                self.code,
-                self.timeframe,
-                self.start_date,
-                self.end_date,
-                exchange=self.exchange,  # 新增
-                proxy_url=self.proxy_url  # 新增
-            )
+            # 🆕 v2.0: 根据设置选择增量更新或全量下载
+            if self.use_smart_update:
+                print("[DEBUG] Step 1: Using Smart Update (Incremental)...")
+                df = self.fetcher.smart_update(
+                    symbol=self.code,
+                    asset_type=self.asset_type,
+                    timeframe=self.timeframe,
+                    start_date=self.start_date,
+                    end_date=self.end_date,
+                    exchange=self.exchange,
+                    proxy_url=self.proxy_url
+                )
+                # smart_update 已经包含了时区标准化，需要手动应用午休过滤
+                if self.filter_lunch:
+                    print("[DEBUG] Applying lunch filter to smart_update result...")
+                    df = self.fetcher._filter_lunch_break(df, self.asset_type)
+            else:
+                print("[DEBUG] Step 1: Using Standard Fetch (Full Download)...")
+                df = self.fetcher.fetch_data(
+                    self.asset_type,
+                    self.code,
+                    self.timeframe,
+                    self.start_date,
+                    self.end_date,
+                    exchange=self.exchange,
+                    proxy_url=self.proxy_url,
+                    filter_lunch=self.filter_lunch  # 🆕 v2.0: 传递午休过滤参数
+                )
             print(f"[DEBUG] Step 1 Complete: Fetched {len(df)} rows")
             
             # Check if data is empty

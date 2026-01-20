@@ -31,6 +31,9 @@ class MainWindow(QMainWindow):
         self.current_timeframe = None  # Store timeframe for export filename
         self.current_start_date = None  # Store start date for export filename
         self._init_ui()
+        
+        # 🆕 启动时执行自动清理和磁盘检查
+        self._perform_startup_checks()
     
     def _init_ui(self):
         """Initialize the user interface."""
@@ -299,6 +302,13 @@ class MainWindow(QMainWindow):
         self.export_parquet_button.setMinimumHeight(35)
         self.export_parquet_button.setToolTip("Parquet格式：压缩率70%，读取速度快10倍")
         button_row.addWidget(self.export_parquet_button)
+        
+        # 🆕 数据管理按钮
+        self.data_manager_button = QPushButton("📊 数据管理")
+        self.data_manager_button.clicked.connect(self._on_data_manager_clicked)
+        self.data_manager_button.setMinimumHeight(35)
+        self.data_manager_button.setToolTip("管理Master DB和导出的数据文件")
+        button_row.addWidget(self.data_manager_button)
         
         button_row.addStretch()
         main_layout.addLayout(button_row)
@@ -840,6 +850,49 @@ class MainWindow(QMainWindow):
                 "导出错误",
                 f"导出{format.upper()}时发生错误:\n\n{str(e)}"
             )
-
-
-
+    
+    def _on_data_manager_clicked(self):
+        """打开数据管理对话框"""
+        try:
+            from .data_manager_dialog import DataManagerDialog
+            dialog = DataManagerDialog(self)
+            dialog.exec()
+        except Exception as e:
+            import traceback
+            error_details = traceback.format_exc()
+            print(f"[DEBUG] ERROR in _on_data_manager_clicked: {str(e)}")
+            print(f"[DEBUG] Full traceback:\n{error_details}")
+            QMessageBox.critical(
+                self,
+                "打开数据管理器失败",
+                f"无法打开数据管理界面:\n\n{str(e)}"
+            )
+    
+    def _perform_startup_checks(self):
+        """启动时执行检查（自动清理和磁盘空间）"""
+        from utils.cache_manager import CacheManager
+        
+        try:
+            # 1. 自动清理旧日志
+            if CacheManager.should_auto_cleanup():
+                print("[INFO] Performing auto cleanup on startup...")
+                CacheManager.perform_auto_cleanup()
+            
+            # 2. 检查磁盘空间
+            settings = CacheManager.load_settings()
+            threshold = settings.get('disk_warning_threshold_gb', 1.0)
+            is_low, free_gb, msg = CacheManager.is_disk_space_low(threshold_gb=threshold)
+            
+            if is_low:
+                reply = QMessageBox.warning(
+                    self,
+                    "磁盘空间警告",
+                    f"{msg}\n\n建议清理旧数据释放空间。\n\n是否打开数据管理中心？",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                )
+                
+                if reply == QMessageBox.StandardButton.Yes:
+                    self._on_data_manager_clicked()
+        
+        except Exception as e:
+            print(f"[ERROR] Startup checks failed: {str(e)}")

@@ -8,6 +8,7 @@ import yfinance as yf
 import ccxt
 from datetime import datetime, timedelta
 import os
+import pytz  # 🆕 时区处理
 
 
 class DataFetcher:
@@ -29,6 +30,7 @@ class DataFetcher:
     
     def __init__(self):
         self.last_error = None
+        self.store_dir = "data/store"  # 🆕 Master DB 目录
     
     def preprocess_code(self, code: str, asset_type: str) -> str:
         """
@@ -60,7 +62,8 @@ class DataFetcher:
     
     def fetch_data(self, asset_type: str, code: str, timeframe: str, 
                    start_date: datetime, end_date: datetime,
-                   exchange: str = None, proxy_url: str = None) -> pd.DataFrame:  # 新增参数
+                   exchange: str = None, proxy_url: str = None,
+                   filter_lunch: bool = False) -> pd.DataFrame:  # 🆕 v2.0: 午休过滤开关
         """
         Main data fetching router.
         
@@ -97,6 +100,13 @@ class DataFetcher:
             
             # Standardize the dataframe
             df = self.standardize_dataframe(df)
+            
+            # 🆕 v2.0: 时区标准化（强制启用）
+            df = self._standardize_timezone(df)
+            
+            # 🆕 v2.0: 午休过滤（可选，由 UI 控制）
+            if filter_lunch:
+                df = self._filter_lunch_break(df, asset_type)
             
             return df
         
@@ -441,6 +451,229 @@ class DataFetcher:
         print(f"[DEBUG] Standardization complete. Final shape: {df.shape}, Columns: {list(df.columns)}")
         return df
     
+    def _standardize_timezone(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        标准化时区为 Asia/Kuala_Lumpur (v2.0)
+        
+        Args:
+            df: 原始DataFrame，Date列可能为UTC或无时区
+        
+        Returns:
+            时区标准化后的DataFrame
+        """
+        print("[DEBUG] Standardizing timezone to Asia/Kuala_Lumpur...")
+        
+        KL_TZ = pytz.timezone('Asia/Kuala_Lumpur')
+        
+        # 确保Date列为datetime类型
+        df['Date'] = pd.to_datetime(df['Date'])
+        
+        # 如果没有时区信息，假定为UTC
+        if df['Date'].dt.tz is None:
+            print("[DEBUG] No timezone info, assuming UTC")
+            df['Date'] = df['Date'].dt.tz_localize('UTC')
+        
+        # 转换为吉隆坡时区
+        df['Date'] = df['Date'].dt.tz_convert(KL_TZ)
+        print(f"[DEBUG] Timezone converted. Sample: {df['Date'].iloc[0]}")
+        
+        # 移除时区信息，保留本地时间（避免Parquet兼容性问题）
+        df['Date'] = df['Date'].dt.tz_localize(None)
+        
+        # 🔧 FIX: 转换回字符串格式，确保与 analyze_gaps() 兼容
+        df['Date'] = df['Date'].dt.strftime('%Y-%m-%d %H:%M:%S')
+        
+        print("[DEBUG] Timezone standardization complete")
+        return df
+    
+    def _filter_lunch_break(self, df: pd.DataFrame, asset_type: str) -> pd.DataFrame:
+        """
+        过滤午休时段 (12:30-14:30 MYT) - 黑名单策略 (v2.0)
+        
+        策略：剔除午休噪音，保留所有其他时间（包括盘前盘后）
+        适用于：Malaysia Stock + FKLI/FCPO
+        
+        Args:
+            df: 原始DataFrame
+            asset_type: 资产类型
+        
+        Returns:
+            过滤后的DataFrame
+        """
+        # 只对马股资产过滤
+        if asset_type not in ["Malaysia Stock", "Futures - Global"]:
+            print(f"[DEBUG] Skipping lunch filter for {asset_type}")
+            return df
+        
+        print(f"[DEBUG] Applying lunch break filter for {asset_type}")
+        
+        # 确保Date列为datetime
+        df['Date'] = pd.to_datetime(df['Date'])
+        
+        # 提取小时和分钟
+        df['_hour'] = df['Date'].dt.hour
+        df['_minute'] = df['Date'].dt.minute
+        
+        # 🔥 黑名单策略：定义午休时段（要被剔除的）
+        is_lunch_break = (
+            (df['_hour'] == 12) & (df['_minute'] > 30)  # 12:31 - 12:59
+        ) | (
+            (df['_hour'] == 13)                          # 13:00 - 13:59
+        ) | (
+            (df['_hour'] == 14) & (df['_minute'] < 30)  # 14:00 - 14:29
+        )
+        
+        # 过滤：保留所有非午休时段的数据
+        filtered_df = df[~is_lunch_break].copy()  # 🎯 注意这里是 ~（取反）
+        
+        # 删除临时列
+        filtered_df.drop(['_hour', '_minute'], axis=1, inplace=True)
+        
+        # 🔧 FIX: 转换回字符串格式，确保与后续方法兼容
+        filtered_df['Date'] = filtered_df['Date'].dt.strftime('%Y-%m-%d %H:%M:%S')
+        
+        removed_count = len(df) - len(filtered_df)
+        print(f"[DEBUG] Filtered {removed_count} lunch break records")
+        
+        return filtered_df
+    
+    def smart_update(self, symbol: str, asset_type: str, timeframe: str,
+                     start_date: datetime = None, end_date: datetime = None,
+                     exchange: str = None, proxy_url: str = None) -> pd.DataFrame:
+        """
+        智能增量更新策略 (v2.0 - Master DB)
+        
+        工作流程：
+        1. 检查 data/store/{symbol}_{timeframe}.parquet 是否存在
+        2. 如果存在，读取最后一条记录的时间戳
+        3. 下载 last_date+1 到 end_date 的新数据
+        4. 合并去重，覆盖保存到 Master DB
+        5. 如果不存在，执行全量下载
+        
+        Args:
+            symbol: 资产代码（已预处理）
+            asset_type: 资产类型
+            timeframe: 时间粒度
+            start_date: 开始日期（仅用于全量下载）
+            end_date: 结束日期（默认为今天）
+            exchange: 交易所（加密货币）
+            proxy_url: 代理URL
+        
+        Returns:
+            合并后的完整DataFrame
+        """
+        # 确保目录存在
+        os.makedirs(self.store_dir, exist_ok=True)
+        
+        # 生成 Master DB 文件名（固定，不带日期）
+        filename = f"{symbol}_{timeframe}.parquet"
+        filepath = os.path.join(self.store_dir, filename)
+        
+        # 默认结束日期为今天
+        if end_date is None:
+            end_date = datetime.now()
+        
+        # 检查本地 Master DB 是否存在
+        if os.path.exists(filepath):
+            print(f"[DEBUG] Found Master DB: {filepath}")
+            
+            try:
+                # 读取现有数据
+                existing_df = pd.read_parquet(filepath)
+                
+                # 获取最后一条记录的日期
+                existing_df['Date'] = pd.to_datetime(existing_df['Date'])
+                last_date = existing_df['Date'].max()
+                
+                print(f"[DEBUG] Last record date: {last_date}")
+                print(f"[DEBUG] Existing records: {len(existing_df)}")
+                
+                # 下载增量数据 (last_date+1 到 end_date)
+                incremental_start = last_date + timedelta(days=1)
+                
+                # 如果增量开始时间已经超过结束时间，说明没有新数据
+                if incremental_start > end_date:
+                    print("[DEBUG] No new data needed, returning existing Master DB")
+                    # 🔧 FIX: 转换为字符串格式再返回
+                    existing_df['Date'] = existing_df['Date'].dt.strftime('%Y-%m-%d %H:%M:%S')
+                    return existing_df
+                
+                print(f"[DEBUG] Incremental download: {incremental_start} to {end_date}")
+                
+                # 获取增量数据（调用原有的 fetch_data）
+                new_df = self.fetch_data(
+                    asset_type=asset_type,
+                    code=symbol,
+                    timeframe=timeframe,
+                    start_date=incremental_start,
+                    end_date=end_date,
+                    exchange=exchange,
+                    proxy_url=proxy_url
+                )
+                
+                if new_df.empty:
+                    print("[DEBUG] No new data fetched, returning existing Master DB")
+                    # 🔧 FIX: 转换为字符串格式再返回
+                    existing_df['Date'] = existing_df['Date'].dt.strftime('%Y-%m-%d %H:%M:%S')
+                    return existing_df
+                
+                print(f"[DEBUG] Fetched {len(new_df)} new records")
+                
+                # 合并数据
+                combined_df = pd.concat([existing_df, new_df], ignore_index=True)
+                
+                # 去重（保留最新）
+                combined_df['Date'] = pd.to_datetime(combined_df['Date'])
+                combined_df = combined_df.drop_duplicates(subset=['Date'], keep='last')
+                combined_df = combined_df.sort_values('Date').reset_index(drop=True)
+                
+                # 🔧 FIX: 转换回字符串格式
+                combined_df['Date'] = combined_df['Date'].dt.strftime('%Y-%m-%d %H:%M:%S')
+                
+                print(f"[DEBUG] After merge and dedup: {len(combined_df)} total records")
+                
+            except Exception as e:
+                print(f"[DEBUG] Error reading Master DB: {str(e)}")
+                print("[DEBUG] Falling back to full download")
+                
+                # 如果读取失败，执行全量下载
+                if start_date is None:
+                    start_date = end_date - timedelta(days=365)  # 默认1年
+                
+                combined_df = self.fetch_data(
+                    asset_type=asset_type,
+                    code=symbol,
+                    timeframe=timeframe,
+                    start_date=start_date,
+                    end_date=end_date,
+                    exchange=exchange,
+                    proxy_url=proxy_url
+                )
+        
+        else:
+            print(f"[DEBUG] No Master DB found, executing full download")
+            
+            # 首次下载：全量
+            if start_date is None:
+                start_date = end_date - timedelta(days=365)  # 默认1年
+            
+            combined_df = self.fetch_data(
+                asset_type=asset_type,
+                code=symbol,
+                timeframe=timeframe,
+                start_date=start_date,
+                end_date=end_date,
+                exchange=exchange,
+                proxy_url=proxy_url
+            )
+        
+        # 保存到 Master DB（覆盖）
+        combined_df.to_parquet(filepath, index=False, compression='snappy')
+        print(f"[DEBUG] Master DB updated: {filepath}")
+        
+        return combined_df
+    
+
     def analyze_gaps(self, df: pd.DataFrame, requested_start: datetime, 
                      requested_end: datetime) -> tuple[bool, str]:
         """
@@ -499,4 +732,43 @@ class DataFetcher:
         # Export without index
         df.to_csv(filepath, index=False, encoding='utf-8-sig')
         
+        return filepath
+    
+    def export_to_parquet(self, df: pd.DataFrame, code: str, timeframe: str, 
+                          start_date: datetime) -> str:
+        """
+        导出DataFrame为Parquet格式 (v2.0)
+        
+        Args:
+            df: 要导出的DataFrame
+            code: 资产代码
+            timeframe: 时间粒度
+            start_date: 开始日期（用于文件名）
+        
+        Returns:
+            导出文件的完整路径
+        """
+        # 生成文件名（带日期）
+        start_str = start_date.strftime('%Y%m%d')
+        filename = f"{code}_{timeframe}_{start_str}.parquet"
+        
+        # 导出目录
+        output_dir = "exported_data"
+        os.makedirs(output_dir, exist_ok=True)
+        filepath = os.path.join(output_dir, filename)
+        
+        # 确保Date列为datetime类型（Parquet要求）
+        df_export = df.copy()
+        if df_export['Date'].dtype == 'object':
+            df_export['Date'] = pd.to_datetime(df_export['Date'])
+        
+        # 导出
+        df_export.to_parquet(
+            filepath,
+            engine='pyarrow',
+            compression='snappy',  # 压缩算法
+            index=False
+        )
+        
+        print(f"[DEBUG] Parquet exported to: {filepath}")
         return filepath
