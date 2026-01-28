@@ -9,6 +9,7 @@ import ccxt
 from datetime import datetime, timedelta
 import os
 import pytz  # 🆕 时区处理
+from tvDatafeed import TvDatafeed, Interval  # 🆕 TradingView数据源
 
 
 class DataFetcher:
@@ -18,19 +19,19 @@ class DataFetcher:
     
     # Timeframe mapping for different APIs
     TIMEFRAME_MAP = {
-        '1m': {'yf': '1m', 'ccxt': '1m'},
-        '5m': {'yf': '5m', 'ccxt': '5m'},
-        '15m': {'yf': '15m', 'ccxt': '15m'},
-        '1h': {'yf': '1h', 'ccxt': '1h'},
-        '1d': {'yf': '1d', 'ccxt': '1d'},
-        '1w': {'yf': '1wk', 'ccxt': '1w'},   # 新增：1周
-        '1M': {'yf': '1mo', 'ccxt': '1M'},   # 新增：1月
-        '1y': {'yf': '1y', 'ccxt': '1y'},    # 新增：1年
+        '1m': {'yf': '1m', 'ccxt': '1m', 'tv': Interval.in_1_minute},
+        '5m': {'yf': '5m', 'ccxt': '5m', 'tv': Interval.in_5_minute},
+        '15m': {'yf': '15m', 'ccxt': '15m', 'tv': Interval.in_15_minute},
+        '1h': {'yf': '1h', 'ccxt': '1h', 'tv': Interval.in_1_hour},
+        '1d': {'yf': '1d', 'ccxt': '1d', 'tv': Interval.in_daily},
+        '1w': {'yf': '1wk', 'ccxt': '1w', 'tv': Interval.in_weekly},
+        '1M': {'yf': '1mo', 'ccxt': '1M', 'tv': Interval.in_monthly},
     }
     
     def __init__(self):
         self.last_error = None
         self.store_dir = "data/store"  # 🆕 Master DB 目录
+        self.tv = TvDatafeed()  # 🆕 TradingView匿名模式
     
     def preprocess_code(self, code: str, asset_type: str) -> str:
         """
@@ -88,6 +89,8 @@ class DataFetcher:
             # 修改：Futures - Global 与股票使用相同的 yfinance 路径
             if asset_type in ["Malaysia Stock", "US Stock", "Futures - Global"]:
                 df = self._fetch_stock_futures(code, timeframe, start_date, end_date)
+            elif asset_type == "Bursa Futures (TV)":  # 🆕 新增：Bursa期货使用TradingView
+                df = self._fetch_tradingview(code, timeframe, start_date, end_date)
             elif asset_type == "Crypto":
                 # 传递交易所和代理参数（新增）
                 df = self._fetch_crypto(code, timeframe, start_date, end_date,
@@ -381,6 +384,140 @@ class DataFetcher:
                 )
             else:
                 raise Exception(f"{exchange} 数据获取失败：{error_msg}")
+    
+    def _fetch_tradingview(self, code: str, timeframe: str,
+                          start_date: datetime, end_date: datetime) -> pd.DataFrame:
+        """
+        从 TradingView 获取 Bursa Malaysia 期货数据 (FCPO, FKLI等)
+        
+        Args:
+            code: 期货代码，例如 'FCPO1!' (连续合约)
+            timeframe: 时间粒度 ('1m', '5m', '15m', '1h', '1d')
+            start_date: 开始日期
+            end_date: 结束日期
+        
+        Returns:
+            DataFrame with OHLCV data (列名: Date, Open, High, Low, Close, Volume)
+        
+        Raises:
+            Exception: 数据获取失败时抛出中文错误提示
+        """
+        try:
+            # 1. 获取 TradingView Interval 枚举
+            if timeframe not in self.TIMEFRAME_MAP:
+                raise ValueError(f"不支持的时间粒度: {timeframe}")
+            
+            tv_interval = self.TIMEFRAME_MAP[timeframe]['tv']
+            print(f"[DEBUG] TradingView: Fetching {code} with interval {tv_interval}")
+            
+            # 2. 🔥 动态计算 n_bars（关键修正）
+            # 分钟级别：40根/天 × 250天 ≈ 10,000根/年
+            # 日线及以上：250-300根/年，请求3000根保险
+            n_bars = 10000 if timeframe in ['1m', '5m', '15m'] else 3000
+            print(f"[DEBUG] TradingView: Requesting {n_bars} bars for timeframe {timeframe}")
+            
+            # 3. 调用 TradingView API (MYX = Bursa Malaysia)
+            df = self.tv.get_hist(
+                symbol=code,
+                exchange='MYX',
+                interval=tv_interval,
+                n_bars=n_bars
+            )
+            
+            if df is None or df.empty:
+                raise Exception(
+                    f"找不到数据！\n\n"
+                    f"可能原因：\n"
+                    f"1. 期货代码 '{code}' 不存在或格式错误\n"
+                    f"2. TradingView 未收录该期货品种\n"
+                    f"3. 网络连接问题\n\n"
+                    f"建议：\n"
+                    f"- 检查代码格式（例如：FCPO1!, FKLI1!）\n"
+                    f"- 确认代码在 TradingView 上可访问\n"
+                    f"- 检查网络连接"
+                )
+            
+            print(f"[DEBUG] TradingView: Received {len(df)} rows")
+            
+            # 4. 数据清洗：重命名列名（TradingView 返回小写）
+            column_mapping = {
+                'open': 'Open',
+                'high': 'High',
+                'low': 'Low',
+                'close': 'Close',
+                'volume': 'Volume'
+            }
+            
+            # 检查并重命名
+            for old_col, new_col in column_mapping.items():
+                if old_col in df.columns:
+                    df.rename(columns={old_col: new_col}, inplace=True)
+            
+            print(f"[DEBUG] TradingView: Columns after renaming: {list(df.columns)}")
+            
+            # 5. 确保索引是 DatetimeIndex，并命名为 Date
+            if not isinstance(df.index, pd.DatetimeIndex):
+                df.index = pd.to_datetime(df.index)
+            
+            df.reset_index(inplace=True)
+            if 'index' in df.columns:
+                df.rename(columns={'index': 'Date'}, inplace=True)
+            elif 'datetime' in df.columns:
+                df.rename(columns={'datetime': 'Date'}, inplace=True)
+            
+            # 6. 根据用户请求的日期范围过滤数据
+            df['Date'] = pd.to_datetime(df['Date'])
+            df = df[(df['Date'] >= start_date) & (df['Date'] <= end_date)]
+            
+            if df.empty:
+                raise Exception(
+                    f"指定日期范围内没有数据！\n\n"
+                    f"请求范围：{start_date.strftime('%Y-%m-%d')} 到 {end_date.strftime('%Y-%m-%d')}\n\n"
+                    f"建议：\n"
+                    f"- 扩大日期范围\n"
+                    f"- 检查该期货品种的上市时间"
+                )
+            
+            print(f"[DEBUG] TradingView: After date filtering: {len(df)} rows")
+            print(f"[DEBUG] TradingView: Date range: {df['Date'].min()} to {df['Date'].max()}")
+            
+            return df
+        
+        except Exception as e:
+            error_msg = str(e)
+            error_type = type(e).__name__
+            print(f"[DEBUG] TradingView ERROR: {error_msg}")
+            print(f"[DEBUG] Error type: {error_type}")
+            
+            # 检测网络连接错误
+            network_error_keywords = [
+                'connection', 'timeout', 'network', 'unreachable',
+                'failed to establish', 'timed out', 'refused',
+                'no internet', 'dns', 'resolve'
+            ]
+            
+            is_network_error = any(keyword.lower() in error_msg.lower() 
+                                  for keyword in network_error_keywords)
+            
+            if is_network_error:
+                raise Exception(
+                    f"TradingView 连接失败！\n\n"
+                    f"⚠️ 无法连接到 TradingView 服务器。\n\n"
+                    f"可能原因：\n"
+                    f"1. 网络连接问题\n"
+                    f"2. TradingView 服务暂时不可用\n"
+                    f"3. 防火墙阻止访问\n\n"
+                    f"建议：\n"
+                    f"- 检查网络连接\n"
+                    f"- 稍后重试\n"
+                    f"- 检查防火墙设置"
+                )
+            else:
+                # 如果已经是友好的中文错误，直接抛出
+                if "找不到数据" in error_msg or "指定日期范围" in error_msg:
+                    raise
+                # 其他错误，包装后抛出
+                raise Exception(f"TradingView 数据获取失败：{error_msg}")
     
     def standardize_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
         """

@@ -153,17 +153,20 @@ class MainWindow(QMainWindow):
         self.asset_button_group = QButtonGroup()
         self.radio_my_stock = QRadioButton("马股")
         self.radio_us_stock = QRadioButton("美股")
-        self.radio_gold = QRadioButton("期货")
+        self.radio_gold = QRadioButton("国际期货 (YF)")  # 修改：重命名以区分
+        self.radio_bursa_futures = QRadioButton("Bursa期货 (TV)")  # 新增：TradingView数据源
         self.radio_crypto = QRadioButton("加密货币")
         
         self.asset_button_group.addButton(self.radio_my_stock, 0)
         self.asset_button_group.addButton(self.radio_us_stock, 1)
         self.asset_button_group.addButton(self.radio_gold, 2)
-        self.asset_button_group.addButton(self.radio_crypto, 3)
+        self.asset_button_group.addButton(self.radio_bursa_futures, 3)
+        self.asset_button_group.addButton(self.radio_crypto, 4)
         
         asset_row.addWidget(self.radio_my_stock)
         asset_row.addWidget(self.radio_us_stock)
         asset_row.addWidget(self.radio_gold)
+        asset_row.addWidget(self.radio_bursa_futures)  # 新增
         asset_row.addWidget(self.radio_crypto)
         asset_row.addStretch()
         
@@ -171,6 +174,7 @@ class MainWindow(QMainWindow):
         self.radio_my_stock.toggled.connect(self._on_asset_type_changed)
         self.radio_us_stock.toggled.connect(self._on_asset_type_changed)
         self.radio_gold.toggled.connect(self._on_asset_type_changed)
+        self.radio_bursa_futures.toggled.connect(self._on_asset_type_changed)  # 新增
         self.radio_crypto.toggled.connect(self._on_asset_type_changed)
         
         main_layout.addLayout(asset_row)
@@ -199,6 +203,7 @@ class MainWindow(QMainWindow):
         self.malaysia_validator = QRegularExpressionValidator(QRegularExpression(r"^\d{0,4}$"))
         self.us_validator = QRegularExpressionValidator(QRegularExpression(r"^[A-Za-z.]{0,10}$"))
         self.futures_validator = QRegularExpressionValidator(QRegularExpression(r"^[A-Za-z0-9=\-.\^]{0,15}$"))
+        self.bursa_futures_validator = QRegularExpressionValidator(QRegularExpression(r"^[A-Za-z0-9!]+$"))  # 新增：允许!字符
         self.crypto_validator = QRegularExpressionValidator(QRegularExpression(r"^[A-Za-z0-9/]{0,20}$"))
         self.code_input.setValidator(self.malaysia_validator)
         
@@ -499,6 +504,8 @@ class MainWindow(QMainWindow):
             return "US Stock"
         elif self.radio_gold.isChecked():
             return "Futures - Global"
+        elif self.radio_bursa_futures.isChecked():  # 新增
+            return "Bursa Futures (TV)"
         elif self.radio_crypto.isChecked():
             return "Crypto"
         else:
@@ -533,6 +540,15 @@ class MainWindow(QMainWindow):
             self.code_input.setPlaceholderText("例如: GC=F, CL=F, SI=F")
             self.code_input.setReadOnly(False)  # 修改：从 True 改为 False
             self.code_input.clear()  # 修改：清空而不是填充 GC=F
+            # 隐藏交易所选择器
+            self.exchange_label.hide()
+            self.exchange_combo.hide()
+        
+        elif asset_type == "Bursa Futures (TV)":  # 新增：Bursa期货（TradingView）
+            self.code_input.setValidator(self.bursa_futures_validator)
+            self.code_input.setPlaceholderText("例如: FCPO1!, FKLI1!")
+            self.code_input.setReadOnly(False)
+            self.code_input.clear()
             # 隐藏交易所选择器
             self.exchange_label.hide()
             self.exchange_combo.hide()

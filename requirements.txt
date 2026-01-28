@@ -4,3 +4,4 @@ ccxt>=4.1.0
 pandas>=2.1.0
 pytz>=2023.3
 pyqtdarktheme>=2.1.0
+git+https://github.com/rongardF/tvdatafeed.git
