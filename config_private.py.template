@@ -1,0 +1,24 @@
+"""
+TradingView Private Configuration Template
+==========================================
+
+⚠️ SECURITY WARNING ⚠️
+This file is ignored by Git (.gitignore).
+Never commit credentials to version control!
+
+Instructions:
+1. Copy this file and rename to: config_private.py
+2. Fill in your TradingView credentials below
+3. Keep this file in the project root directory
+4. Verify config_private.py appears in .gitignore
+
+"""
+
+# TradingView Account Credentials
+# Replace with your actual credentials
+TV_USERNAME = "your_email@example.com"  # Your TradingView email
+TV_PASSWORD = "your_password_here"       # Your TradingView password
+
+# Example (DO NOT USE):
+# TV_USERNAME = "trader123@gmail.com"
+# TV_PASSWORD = "MyS3cur3P@ssw0rd"

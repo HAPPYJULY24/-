@@ -416,10 +416,23 @@ class DataFetcher:
             n_bars = 10000 if timeframe in ['1m', '5m', '15m'] else 3000
             print(f"[DEBUG] TradingView: Requesting {n_bars} bars for timeframe {timeframe}")
             
-            # 3. 调用 TradingView API (MYX = Bursa Malaysia)
+            # 3. 🔄 自动识别交易所（根据期货代码前缀）
+            symbol_upper = code.upper()
+            
+            # CBOT (芝加哥商品交易所) 期货代码列表
+            cbot_symbols = ['ZL', 'BO', 'ZS', 'ZC', 'ZW', 'MYM', 'ZN', 'ZT', 'ZF', 'ZB']
+            
+            if any(symbol_upper.startswith(prefix) for prefix in cbot_symbols):
+                exchange = 'CBOT'
+                print(f"[INFO] 检测到美国期货代码，自动切换至 CBOT 交易所: {code}")
+            else:
+                exchange = 'MYX'  # 默认为马来西亚交易所 (FCPO, FKLI 等)
+                print(f"[INFO] 使用默认 MYX 交易所: {code}")
+            
+            # 4. 调用 TradingView API
             df = self.tv.get_hist(
                 symbol=code,
-                exchange='MYX',
+                exchange=exchange,  # 🔄 使用自动识别的交易所
                 interval=tv_interval,
                 n_bars=n_bars
             )

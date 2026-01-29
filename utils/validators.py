@@ -37,10 +37,9 @@ def validate_code(code: str, asset_type: str) -> tuple[bool, str]:
             return False, "美股代码格式错误！\n\n请输入字母代码，例如：AAPL, MSFT, TSLA"
     
     elif asset_type == "Futures - Global":
-        # 修改：期货代码允许等号、减号、点号（例如：GC=F, CL=F, ES-MAR23）
-        import re
-        if not re.match(r'^[A-Za-z0-9=\-.^]+$', code):
-            return False, "期货代码格式错误！\n\n请输入有效的期货代码\n例如：GC=F（黄金）, CL=F（原油）, SI=F（白银）"
+        # 修改：移除期货代码验证，允许任意格式（包括 ZL1!, GC=F 等）
+        # 不再限制字符类型，由用户自由输入
+        pass  # 无验证，直接通过
     
     elif asset_type == "Crypto":
         # Crypto pairs should contain /

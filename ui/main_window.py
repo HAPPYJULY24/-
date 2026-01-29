@@ -5,7 +5,7 @@ Main Window - Primary application interface for Quant Data Bridge.
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QLabel, QLineEdit, QComboBox, QRadioButton,
                              QPushButton, QDateEdit, QGroupBox, QButtonGroup,
-                             QMessageBox, QCheckBox)
+                             QMessageBox, QCheckBox, QMenuBar)
 from PyQt6.QtCore import Qt, QDate
 from PyQt6.QtGui import QFont
 from datetime import datetime
@@ -39,6 +39,9 @@ class MainWindow(QMainWindow):
         """Initialize the user interface."""
         self.setWindowTitle("Quant Data Bridge")
         self.setMinimumSize(900, 700)
+        
+        # 创建菜单栏
+        self._create_menu_bar()
         
         # Create central widget
         central_widget = QWidget()
@@ -534,12 +537,12 @@ class MainWindow(QMainWindow):
             self.exchange_label.hide()
             self.exchange_combo.hide()
             
-        elif asset_type == "Futures - Global":  # 修改：从锁定改为可输入
-            # 期货现在允许用户自由输入（通用模式）
-            self.code_input.setValidator(self.futures_validator)
-            self.code_input.setPlaceholderText("例如: GC=F, CL=F, SI=F")
-            self.code_input.setReadOnly(False)  # 修改：从 True 改为 False
-            self.code_input.clear()  # 修改：清空而不是填充 GC=F
+        elif asset_type == "Futures - Global":  # 修改：移除输入限制
+            # 期货允许用户自由输入（无验证限制）
+            self.code_input.setValidator(None)  # 修改：移除验证器，允许任意字符
+            self.code_input.setPlaceholderText("例如: GC=F, CL=F, SI=F, ES=F")
+            self.code_input.setReadOnly(False)
+            self.code_input.clear()
             # 隐藏交易所选择器
             self.exchange_label.hide()
             self.exchange_combo.hide()
@@ -746,7 +749,7 @@ class MainWindow(QMainWindow):
             print("[DEBUG] _on_fetch_finished called!")
             print("="*60 + "\n")
             
-            # Re-enable button
+            # Re-enable download button
             self.fetch_button.setEnabled(True)
             self.fetch_button.setText("获取数据 (Fetch Data)")
             
@@ -754,9 +757,67 @@ class MainWindow(QMainWindow):
             if self.current_worker:
                 self.current_worker.deleteLater()
                 self.current_worker = None
-            print("[DEBUG] Finished handler completed!\n")
+            
+            # 🆕 自动数据处理：检查是否需要生成对齐数据集
+            self._try_auto_process_data()
+            
+            print("[DEBUG] Fetch finished handling completed!\n")
         except Exception as e:
             print(f"[DEBUG] ERROR in _on_fetch_finished: {str(e)}")
+    
+    def _try_auto_process_data(self):
+        """
+        尝试自动处理数据（对齐 FCPO 和 ZL1）
+        仅当两个数据文件都存在时才执行
+        """
+        try:
+            import os
+            from pathlib import Path
+            
+            # 检查是否启用自动处理（可以后续添加设置）
+            # 目前默认启用
+            
+            # 检查数据文件是否存在
+            store_dir = Path("data/store")
+            fcpo_file = store_dir / "FCPO1!_15m.parquet"
+            zl_file = store_dir / "ZL1!_15m.parquet"
+            
+            if not fcpo_file.exists() or not zl_file.exists():
+                print(f"[DataProcessor] ⏭️  跳过自动处理 (缺少数据文件)")
+                print(f"  - FCPO1!: {'✅' if fcpo_file.exists() else '❌'}")
+                print(f"  - ZL1!: {'✅' if zl_file.exists() else '❌'}")
+                return
+            
+            # 显示处理提示
+            print(f"\n[DataProcessor] 🔄 检测到 FCPO 和 ZL1 数据，开始自动对齐...")
+            self.status_banner.show_info("正在生成对齐后的数据集...")
+            
+            # 导入并运行数据处理器
+            from core.data_processor import DataProcessor
+            
+            processor = DataProcessor(
+                store_dir="data/store",
+                output_dir="data/processed"
+            )
+            
+            # 执行对齐
+            merged_df = processor.align_datasets(
+                base_symbol='FCPO1!',
+                target_symbol='ZL1!',
+                timeframe='15m'
+            )
+            
+            # 更新状态
+            self.status_banner.show_success(
+                f"✅ 数据对齐完成！已生成 {len(merged_df)} 行合并数据 → data/processed/"
+            )
+            
+        except Exception as e:
+            print(f"[DataProcessor] ⚠️  自动处理失败: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            # 不影响主流程，只是日志记录
+    
     
     def _on_export_clicked(self, format='csv'):
         """
@@ -912,3 +973,54 @@ class MainWindow(QMainWindow):
         
         except Exception as e:
             print(f"[ERROR] Startup checks failed: {str(e)}")
+    
+    def _create_menu_bar(self):
+        """创建菜单栏"""
+        menubar = self.menuBar()
+        
+        # 设置菜单 (Settings Menu)
+        settings_menu = menubar.addMenu("⚙️ 设置")
+        
+        # TradingView 配置
+        tv_settings_action = settings_menu.addAction("🔐 TradingView 配置")
+        tv_settings_action.triggered.connect(self._open_settings)
+        
+        # === 🆕 工具菜单 ===
+        tools_menu = menubar.addMenu("🔧 工具")
+        
+        # 数据对齐实验室
+        alignment_action = tools_menu.addAction("🔬 Data Alignment Studio")
+        alignment_action.setStatusTip("打开数据对齐实验室 - 对齐不同品种的数据")
+        alignment_action.triggered.connect(self._open_alignment_studio)
+    
+    def _open_alignment_studio(self):
+        """打开数据对齐实验室"""
+        try:
+            from ui.alignment_dialog import AlignmentDialog
+            
+            dialog = AlignmentDialog(self)
+            dialog.exec()
+            
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            QMessageBox.critical(
+                self,
+                "启动错误",
+                f"无法打开数据对齐工具:\n\n{str(e)}"
+            )
+    
+    def _open_settings(self):
+        """打开设置对话框"""
+        from ui.settings_dialog import SettingsDialog
+        
+        dialog = SettingsDialog(self)
+        if dialog.exec():
+            # 用户点击了保存，显示提示
+            QMessageBox.information(
+                self,
+                "配置已保存",
+                "TradingView 配置已保存！\n\n"
+                "请重启应用以使新配置生效。\n\n"
+                "下次启动时，应用将使用新的凭证进行认证。"
+            )

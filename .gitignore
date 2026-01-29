@@ -47,6 +47,7 @@ data/store/*.parquet
 
 # 🆕 用户配置(不提交)
 config/
+config_private.py
 
 # PyInstaller
 *.spec

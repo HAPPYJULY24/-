@@ -1,152 +1,96 @@
 # Quant Data Bridge
 
-一个现代化的量化数据获取桌面应用，支持从多个数据源获取金融数据，清洗为标准化 OHLCV 格式，并导出 CSV 文件。
+一个现代化的量化数据获取与处理平台，支持多源金融数据获取、清洗、对齐，专为量化回测设计。
 
-## 功能特性
+## ✨ 核心特性 (v2.0)
 
-### 支持的资产类型
-- **马股 (Malaysia Stock)** - 通过 yfinance 获取马来西亚股票数据
-- **美股 (US Stock)** - 通过 yfinance 获取美国股票数据
-- **期货 (Futures - Global)** - 支持任意 yfinance 期货代码 (GC=F, CL=F, SI=F, ES=F 等)
-- **加密货币 (Crypto)** - 支持多交易所选择 (Luno, Binance, OKX, Bybit)
+### 1. 多源数据获取
+- **TradingView (Futures)** - 通过 `tvDatafeed` 获取全球期货数据 (CBOT, Bursa, COMEX 等)
+  - ✅ **自动交易所识别** - 输入 `ZL1!` 自动切换 CBOT，`FCPO1!` 自动切换 MYX
+  - ✅ **超长历史数据** - 智能突破 5000 根限制，自动分段下载并拼接
+- **Yahoo Finance** - 获取全球股票、外汇、贵金属
+- **CCXT** - 支持 Binance, OKX, Bybit, Luno 等加密货币交易所
 
-### 核心功能
-- ✅ 现代化 PyQt6 图形界面（紧凑水平布局）
-- ✅ 动态资产类型切换与智能输入提示
-- ✅ **8种时间粒度**: 1m, 5m, 15m, 1h, 1d, 1w, 1M, 1y
-- ✅ 日期范围选择器
-- ✅ 异步数据获取（界面不卡顿）
-- ✅ **多交易所支持** - 加密货币可选择交易所
-- ✅ **网络代理配置** - 支持 HTTP/HTTPS 代理访问被墙交易所
-- ✅ **数据行数统计** - 实时显示获取的数据条数
-- ✅ 数据质量检查与高亮显示
-- ✅ Gap 分析（3天容差）
-- ✅ 手动导出标准化 CSV
+### 2. 🔬 Data Alignment Studio (数据对齐实验室)
+一个交互式的数据处理工具，专门解决"多品种对齐难"的问题。
+- **任意对齐** - 选择任意两个 Parquet 文件进行对齐 (如 FCPO vs ZL, BTC vs ETH)
+- **智能时区** - 自动检测并将所有数据统一转换为 UTC
+- **动态列名** - 自动提取 Symbol 并重命名列 (如 `FCPO_Close`, `ZL_Close`)
+- **Forward Fill** - 智能填补不同交易时间造成的空缺
+- **实时预览** - 立即查看前50行+后50行结果，支持导出 CSV/Parquet
 
-## 安装依赖
+### 3. 数据存储与格式
+- **Parquet (主存储)** - 使用高效的 Parquet 格式存储历史数据，体积小、读取快
+- **CSV (导出)** - 支持导出为通用 CSV 格式
+- **Master DB** - 增量更新模式，只下载最新的数据
 
+---
+
+## 🚀 快速开始
+
+### 1. 安装依赖
 ```bash
 pip install -r requirements.txt
 ```
 
-## 运行应用
-
+### 2. 运行应用
 ```bash
 python main.py
 ```
 
-## 使用示例
+### 3. 使用场景示例
 
-### 1. 获取马股数据
-1. 选择 "马股"
-2. 输入代码: `1155` (自动转换为 1155.KL)
-3. 选择时间粒度: `1d`
-4. 设置日期范围
-5. 点击 "获取数据"
+#### 场景 A: 准备跨品种套利数据 (FCPO vs ZL)
+1. **下载数据**:
+   - 选择 "Bursa期货 (TV)"
+   - 输入 `FCPO1!` (时间粒度 15m) → 下载
+   - 输入 `ZL1!` (自动识别 CBOT) → 下载
+2. **数据对齐**:
+   - 菜单栏点击 **"🔧 工具"** → **"🔬 Data Alignment Studio"**
+   - 选择 Asset A: `FCPO1!_15m.parquet`
+   - 选择 Asset B: `ZL1!_15m.parquet`
+   - 点击 "🚀 开始对齐"
+3. **导出结果**:
+   - 预览对齐结果（红色高亮缺失值）
+   - 点击 "💾 导出结果" 保存为 CSV 用于回测
 
-### 2. 获取加密货币数据（使用代理）
-1. 选择 "加密货币"
-2. 选择交易所: `Binance (Global)` 或 `OKX`
-3. 输入交易对: `BTC/USDT`
-4. **展开"网络设置"** → 勾选"启用代理" → 输入代理 URL (如 `http://127.0.0.1:7890`)
-5. 选择时间粒度: `1h` 或 `1d`
-6. 设置日期范围
-7. 点击 "获取数据"
+#### 场景 B: 获取加密货币数据（使用代理）
+1. 选择 "加密货币" → 交易所 `Binance`
+2. 输入 `BTC/USDT`
+3. 展开 "网络设置" → 启用代理 (`http://127.0.0.1:7890`)
+4. 点击下载
 
-### 3. 获取期货数据（通用）
-1. 选择 "期货"
-2. 输入期货代码: `GC=F` (黄金), `CL=F` (原油), `SI=F` (白银), `ES=F` (标普500)
-3. 选择时间粒度和日期范围
-4. 点击 "获取数据"
+---
 
-## 导出文件
-
-点击 "导出 CSV" 按钮后，CSV 文件保存在 `exported_data/` 目录，文件命名格式：
-
-```
-{Code}_{Timeframe}_{StartDate}.csv
-```
-
-例如: `1155.KL_1d_20240101.csv`
-
-## 项目结构
+## 📂 项目结构
 
 ```
 ├── main.py                 # 应用入口
-├── requirements.txt        # 依赖列表
-├── .gitignore             # Git 忽略配置
-├── ui/                     # UI 组件
-│   ├── main_window.py      # 主窗口（紧凑布局）
-│   ├── status_banner.py    # 状态横幅
-│   └── data_grid.py        # 数据预览表格
-├── core/                   # 核心逻辑
-│   ├── data_fetcher.py     # 数据获取引擎（多交易所+代理）
-│   └── worker.py           # 异步工作线程
-└── utils/                  # 工具函数
-    └── validators.py       # 输入验证
+├── core/                   # 核心引擎
+│   ├── data_fetcher.py     # 数据获取 (支持 TV, YF, CCXT)
+│   ├── data_processor.py   # 数据对齐与处理 (Pandas)
+│   └── worker.py           # 异步线程
+├── ui/                     # 用户界面
+│   ├── main_window.py      # 主窗口
+│   ├── alignment_dialog.py # 数据对齐实验室 (新)
+│   └── settings_dialog.py  # 配置对话框
+├── data/
+│   ├── store/              # Master DB (Parquet)
+│   └── processed/          # 处理后的数据
+└── exported_data/          # 导出的 CSV 文件
 ```
 
-## 技术栈
+## 🛠️ 技术栈
+- **GUI**: PyQt6 (现代化 Material 风格)
+- **Data**: pandas, numpy, pyarrow
+- **Feed**: tvdatafeed, yfinance, ccxt
+- **Network**: requests (支持 HTTP/HTTPS 代理)
 
-- **GUI**: PyQt6
-- **数据源**: 
-  - yfinance (股票/期货)
-  - ccxt (加密货币 - Luno/Binance/OKX/Bybit)
-- **数据处理**: pandas
-- **网络**: 支持 HTTP/HTTPS 代理
-
-## 特色功能
-
-### 多交易所支持
-- 加密货币支持 4 个交易所：Luno (Malaysia), Binance, OKX, Bybit
-- 用户可根据地区和需求选择最佳交易所
-- 自动处理不同交易所的 API 差异
-
-### 网络代理配置
-- 支持 HTTP/HTTPS 代理
-- 可访问被防火墙屏蔽的交易所
-- 默认代理地址：`http://127.0.0.1:7890`
-
-### 智能网络错误检测
-- 自动识别网络连接失败
-- 友好的中文错误提示
-- 建议启用代理或切换交易所
-
-### 紧凑 UI 设计
-- 水平布局最大化数据预览空间
-- 4行配置区域：资产类型 → 代码/交易所/时间 → 日期 → 按钮
-- 实时显示数据行数统计
-
-### 数据质量监控
-- 红色高亮显示 Volume=0 的行
-- 红色高亮显示 Close=NaN 的行
-- 自动检测数据缺口并发出警告
-- 显示获取的数据总行数
-
-### 异步处理
-- 使用 QThread 防止界面冻结
-- 实时状态更新
-- 获取过程中按钮禁用
-
-## 状态横幅
-
-- 🟢 **绿色 (成功)**: 数据获取成功，覆盖率 100%
-- 🟡 **黄色 (警告)**: 数据不完整，存在缺口 (>3天)
-- 🔴 **红色 (错误)**: 网络错误、API 错误或资产不存在
-
-## 打包为 EXE
-
-参考 `PYINSTALLER_GUIDE.md` 获取详细的打包说明。
-
-快速命令：
+## 📦 打包发布
+使用 PyInstaller 打包为独立 EXE：
 ```bash
 pyinstaller Quant_Data_Bridge.spec
 ```
 
-## 开发者
-
-技术栈: Python + PyQt6 + yfinance + ccxt
-
 ---
-
-**Quant Data Bridge** - 为量化交易提供高质量的数据桥梁 🚀
+**Quant Data Bridge** - 专注于解决量化数据的"最后一公里"问题。
