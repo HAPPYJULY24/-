@@ -58,23 +58,35 @@ def setup_logging():
     # 配置日志格式
     log_format = '%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s'
     
-    # 创建控制台处理器，设置为 UTF-8 编码
-    import io
-    console_handler = logging.StreamHandler(
-        io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', line_buffering=True)
-    )
-    console_handler.setFormatter(logging.Formatter(log_format))
+    # 准备日志处理器列表
+    handlers = [
+        # 文件处理器 - 始终记录到文件（UTF-8）
+        logging.FileHandler(log_file, encoding='utf-8', mode='a')
+    ]
+    
+    # 安全地添加控制台处理器 (仅当有控制台窗口时)
+    # 在 PyInstaller --noconsole 模式下，sys.stdout 可能为 None 或无法写入
+    if sys.stdout is not None:
+        try:
+            import io
+            # 尝试使用 buffer 以获得更好的编码控制 (Windows终端修复)
+            if hasattr(sys.stdout, 'buffer'):
+                stream = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', line_buffering=True)
+            else:
+                stream = sys.stdout
+                
+            console_handler = logging.StreamHandler(stream)
+            console_handler.setFormatter(logging.Formatter(log_format))
+            handlers.append(console_handler)
+        except Exception:
+            # 如果设置控制台日志失败，静默失败，不要让程序崩溃
+            pass
     
     # 配置根日志记录器
     logging.basicConfig(
         level=logging.INFO,
         format=log_format,
-        handlers=[
-            # 文件处理器 - 记录到文件（UTF-8）
-            logging.FileHandler(log_file, encoding='utf-8', mode='a'),
-            # 控制台处理器 - 使用 UTF-8 编码
-            console_handler
-        ]
+        handlers=handlers
     )
     
     logging.info("=" * 60)
