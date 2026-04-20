@@ -1,0 +1,14 @@
+PyQt6
+pandas==2.2.0
+numpy
+yfinance
+git+https://github.com/rongardF/tvdatafeed.git
+ccxt
+matplotlib
+pyqtgraph
+pyarrow
+pyqtdarktheme
+pytest
+pytz
+scipy
+scikit-learn

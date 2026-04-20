@@ -74,12 +74,39 @@ class DataPreviewDialog(QDialog):
         self.setLayout(layout)
     
     def _load_data(self):
-        """Load and display data from parquet file"""
+        """Load and display data from parquet/csv/json file"""
         try:
-            # Read parquet file
-            df = pd.read_parquet(self.filepath)
+            import os
+            ext = os.path.splitext(self.filepath)[1].lower()
+            
+            if ext == '.json':
+                import json
+                with open(self.filepath, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                
+                from PyQt6.QtWidgets import QTextEdit
+                self.text_edit = QTextEdit()
+                self.text_edit.setReadOnly(True)
+                self.text_edit.setPlainText(json.dumps(data, indent=2, ensure_ascii=False))
+                
+                # Replace table with text edit
+                self.layout().replaceWidget(self.table, self.text_edit)
+                self.table.hide()
+                self.info_label.setText("JSON 格式预览 (JSON Format Preview)")
+                return
+                
+            # Read tabular data
+            if ext == '.csv':
+                df = pd.read_csv(self.filepath)
+            else:
+                df = pd.read_parquet(self.filepath)
+                
             total_rows = len(df)
             
+            # Make sure Date is a column so it shows in preview
+            if 'Date' not in df.columns and (df.index.name == 'Date' or isinstance(df.index, pd.DatetimeIndex)):
+                df = df.reset_index()
+                
             # Get first N rows
             preview_df = df.head(self.max_rows)
             
@@ -100,7 +127,7 @@ class DataPreviewDialog(QDialog):
             self.table.setHorizontalHeaderLabels(preview_df.columns.tolist())
             
             # Fill table
-            for row_idx, row in preview_df.iterrows():
+            for table_row_idx, (df_idx, row) in enumerate(preview_df.iterrows()):
                 for col_idx, value in enumerate(row):
                     # Format value
                     if pd.isna(value):
@@ -111,7 +138,7 @@ class DataPreviewDialog(QDialog):
                         display_value = str(value)
                     
                     item = QTableWidgetItem(display_value)
-                    self.table.setItem(row_idx, col_idx, item)
+                    self.table.setItem(table_row_idx, col_idx, item)
             
             # Auto-resize columns
             self.table.horizontalHeader().setSectionResizeMode(

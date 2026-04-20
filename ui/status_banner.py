@@ -30,7 +30,7 @@ class StatusBanner(QFrame):
     def _init_ui(self):
         """Initialize the banner UI."""
         # 设置固定最大高度，防止压缩其他UI元素
-        self.setMaximumHeight(120)  # 限制最大高度
+        self.setMaximumHeight(300)  # 限制最大高度
         self.setMinimumHeight(0)  # 隐藏时高度为0
         
         # 创建水平布局
@@ -136,6 +136,27 @@ class StatusBanner(QFrame):
             }
             QLabel {
                 color: #721c24;
+            }
+        """)
+        self.show()
+        self._start_auto_hide_timer()
+        
+    def show_info(self, message: str):
+        """
+        Display an info message (blue background).
+        
+        Args:
+            message: Info message to display
+        """
+        self.message_label.setText(f"ℹ {message}")
+        self.setStyleSheet("""
+            QFrame {
+                background-color: #d1ecf1;
+                border: 1px solid #bee5eb;
+                border-radius: 5px;
+            }
+            QLabel {
+                color: #0c5460;
             }
         """)
         self.show()

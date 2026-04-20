@@ -4,14 +4,43 @@ Quant Data Bridge - Main entry point for the application.
 """
 
 import sys
+import faulthandler
+
+# Windows 终端乱码修复：强行重配所有标准输出流的编码为 utf-8
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8')
+if hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(encoding='utf-8')
 import os
 import logging
+import warnings
 from datetime import datetime
 from PyQt6.QtWidgets import QApplication, QSplashScreen, QLabel
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QFont
 import qdarktheme
 from ui.main_window import MainWindow
+
+# 忽略无害的 Numpy Runtime 警告 (如空切片、除零、cov 自由度)
+warnings.filterwarnings('ignore', category=RuntimeWarning, module='numpy.*|pandas.*')
+
+
+_FAULT_LOG_HANDLE = None
+
+
+def setup_fault_handler():
+    """
+    Enable faulthandler to capture native crashes (segfault/access violation).
+    """
+    global _FAULT_LOG_HANDLE
+    try:
+        fault_log = os.path.join(os.path.abspath("."), "app_fault.log")
+        _FAULT_LOG_HANDLE = open(fault_log, "a", encoding="utf-8")
+        faulthandler.enable(file=_FAULT_LOG_HANDLE, all_threads=True)
+        logging.info(f"faulthandler enabled, fault log: {fault_log}")
+    except Exception as e:
+        # Never block startup because diagnostics setup failed.
+        logging.warning(f"Failed to enable faulthandler: {e}")
 
 
 # ==================== 1. 资源路径自适应 ====================
@@ -168,6 +197,7 @@ def main():
     try:
         # 1. 初始化日志系统
         setup_logging()
+        setup_fault_handler()
         
         # 2. 设置全局异常处理器
         sys.excepthook = global_exception_handler
@@ -219,6 +249,15 @@ def main():
         # 捕获主函数中的任何异常
         logging.critical(f"主函数发生严重错误: {str(e)}", exc_info=True)
         return 1
+    finally:
+        global _FAULT_LOG_HANDLE
+        if _FAULT_LOG_HANDLE:
+            try:
+                _FAULT_LOG_HANDLE.flush()
+                _FAULT_LOG_HANDLE.close()
+            except Exception:
+                pass
+            _FAULT_LOG_HANDLE = None
 
 
 if __name__ == "__main__":

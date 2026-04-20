@@ -1,15 +1,18 @@
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, 
                              QLabel, QGroupBox, QCheckBox, QLineEdit, 
                              QPushButton, QComboBox, QDateEdit, 
-                             QMessageBox, QButtonGroup, QRadioButton)
-from PyQt6.QtCore import Qt, QDate, QRegularExpression
+                             QMessageBox, QButtonGroup, QRadioButton, QTimeEdit)
+from PyQt6.QtCore import Qt, QDate, QRegularExpression, QTime
 from PyQt6.QtGui import QFont, QRegularExpressionValidator
 from datetime import datetime
 
 from ..status_banner import StatusBanner
 from ..data_grid import DataGrid
-from core.worker import FetchWorker
-from core.data_fetcher import DataFetcher
+from src.core.workers.fetch_worker import FetchWorker
+from src.quant_bridge import DataFetcher
+from logic.localization import tr
+
+
 from utils.validators import validate_code, validate_date_range
 
 class FetcherTab(QWidget):
@@ -21,6 +24,8 @@ class FetcherTab(QWidget):
         self.fetcher = DataFetcher()
         self.current_worker = None
         self.current_df = None
+        self.current_rows = []
+        self.current_columns = []
         self.current_code = None
         self.current_timeframe = None
         self.current_start_date = None
@@ -79,13 +84,34 @@ class FetcherTab(QWidget):
         )
         advanced_layout.addWidget(self.incremental_update_checkbox)
         
-        self.filter_lunch_checkbox = QCheckBox("⏰ 过滤午休时段 (Filter Lunch Break: 12:30-14:30)")
-        self.filter_lunch_checkbox.setChecked(False)
-        self.filter_lunch_checkbox.setToolTip(
-            "开启后，将自动过滤午休时段（12:30-14:30）的噪音数据。\n"
-            "适用于马股和期货，保留盘前盘后数据。"
-        )
-        advanced_layout.addWidget(self.filter_lunch_checkbox)
+        # Session Filter Checkbox
+        self.apply_session_filter_checkbox = QCheckBox(tr("ui.apply_session_filter"))
+        self.apply_session_filter_checkbox.toggled.connect(self._on_session_filter_toggled)
+        advanced_layout.addWidget(self.apply_session_filter_checkbox)
+        
+        # Custom Session Input (Hidden by default)
+        self.session_container = QWidget()
+        session_layout = QHBoxLayout()
+        session_layout.setContentsMargins(0, 0, 0, 0)
+        
+        session_label = QLabel(tr("ui.custom_session"))
+        self.session_start = QTimeEdit()
+        self.session_start.setDisplayFormat("HH:mm")
+        self.session_start.setTime(QTime(20, 0))
+        
+        self.session_end = QTimeEdit()
+        self.session_end.setDisplayFormat("HH:mm")
+        self.session_end.setTime(QTime(4, 0))
+        
+        session_layout.addWidget(session_label)
+        session_layout.addWidget(self.session_start)
+        session_layout.addWidget(QLabel("-"))
+        session_layout.addWidget(self.session_end)
+        session_layout.addStretch()
+        
+        self.session_container.setLayout(session_layout)
+        self.session_container.hide()
+        advanced_layout.addWidget(self.session_container)
         
         advanced_group.setLayout(advanced_layout)
         main_layout.addWidget(advanced_group)
@@ -107,6 +133,9 @@ class FetcherTab(QWidget):
         main_layout.addWidget(self.data_grid)
         
         self.setLayout(main_layout)
+        
+        # Initial validation check
+        self._validate_request()
         
     def _create_config_panel(self) -> QGroupBox:
         """Create the input configuration panel."""
@@ -264,13 +293,94 @@ class FetcherTab(QWidget):
         self.export_parquet_button.clicked.connect(lambda: self._on_export_clicked('parquet'))
         self.export_parquet_button.setEnabled(False)
         self.export_parquet_button.setMinimumHeight(35)
+        self.export_parquet_button.setMinimumHeight(35)
         button_row.addWidget(self.export_parquet_button)
+        
+        # New Save to Master DB Button (v2.6)
+        self.save_db_button = QPushButton("💾 保存至数据中心 (Save to Master DB)")
+        self.save_db_button.clicked.connect(self._on_save_db_clicked)
+        self.save_db_button.setEnabled(False)
+        self.save_db_button.setMinimumHeight(35)
+        self.save_db_button.setStyleSheet("background-color: #2c3e50; color: white; font-weight: bold;")
+        button_row.addWidget(self.save_db_button)
         
         button_row.addStretch()
         main_layout.addLayout(button_row)
         
+        # Validation Feedback Label
+        self.lbl_validator_msg = QLabel("")
+        self.lbl_validator_msg.setWordWrap(True)
+        self.lbl_validator_msg.setMaximumHeight(40)
+        main_layout.addWidget(self.lbl_validator_msg)
+        
         group.setLayout(main_layout)
+        
+        # Connect signals for validation
+        self.timeframe_combo.currentIndexChanged.connect(self._validate_request)
+        self.start_date.dateChanged.connect(self._validate_request)
+        
         return group
+
+    def _validate_request(self, *args):
+        """
+        Defensive Validation Logic (v2.0)
+        Prevents invalid Yahoo Finance API requests based on known limits.
+        """
+        timeframe = self.timeframe_combo.currentText()
+        start_qdate = self.start_date.date()
+        today = QDate.currentDate()
+        days_diff = start_qdate.daysTo(today)
+        
+        # Scenario A: Intraday (5m-1h) > 60 days
+        if timeframe in ['5m', '15m', '1h'] and days_diff > 60:
+            msg = tr("messages.intraday_limit_60d_v2")
+            if "messages." in msg:
+                msg = f"Intraday data ({timeframe}) is only available for the LAST 60 days from today.\nYour State Date is {days_diff} days ago."
+            
+            self.lbl_validator_msg.setText(f"⚠ {msg}")
+            self.lbl_validator_msg.setStyleSheet("color: red; font-weight: bold;")
+            self.fetch_button.setEnabled(False)
+            return
+
+        # Scenario B: 1m Critical > 7 days
+        if timeframe == '1m' and days_diff > 7:
+            msg = tr("messages.minute_limit_7d_v2")
+            if "messages." in msg:
+                 msg = f"1-minute data is only available for the LAST 7 days from today.\nYour Start Date is {days_diff} days ago."
+
+            self.lbl_validator_msg.setText(f"⚠ {msg}")
+            self.lbl_validator_msg.setStyleSheet("color: red; font-weight: bold;")
+            self.fetch_button.setEnabled(False)
+            return
+
+        # Scenario C: Timeframe > Date Range (e.g., 1y timeframe for 1d range)
+        min_days = self._get_min_days_for_timeframe(timeframe)
+        if days_diff < min_days:
+            msg = tr("messages.insufficient_date_range").format(tf=timeframe, min_days=min_days)
+            # Fallback if translation key missing
+            if "messages." in msg:
+                msg = f"Timeframe '{timeframe}' requires at least {min_days} days range."
+            
+            self.lbl_validator_msg.setText(f"⚠ {msg}")
+            self.lbl_validator_msg.setStyleSheet("color: red; font-weight: bold;")
+            self.fetch_button.setEnabled(False)
+            return
+
+        # Scenario D: Safe
+        self.lbl_validator_msg.setText("")
+        self.lbl_validator_msg.setStyleSheet("")
+        self.fetch_button.setEnabled(True)
+
+    def _get_min_days_for_timeframe(self, timeframe: str) -> int:
+        """Get minimum required days for a timeframe."""
+        mapping = {
+            '1m': 0, '5m': 0, '15m': 0, '1h': 0,  # Intraday needs < 1 day effectively, but days_diff is dates
+            '1d': 0,
+            '1w': 7,
+            '1M': 28,
+            '1y': 365
+        }
+        return mapping.get(timeframe, 0)
 
     def _get_selected_asset_type(self) -> str:
         if self.radio_my_stock.isChecked(): return "Malaysia Stock"
@@ -308,6 +418,34 @@ class FetcherTab(QWidget):
             self.exchange_label.show()
             self.exchange_combo.show()
         self.code_input.clear()
+        
+        # Session Filter Logic (v2.5)
+        if asset_type in ["Malaysia Stock", "Bursa Futures (TV)"]:
+            # Automatic filtering (Enforced)
+            self.apply_session_filter_checkbox.blockSignals(True) # Prevent toggling logic during setup
+            self.apply_session_filter_checkbox.setChecked(True)
+            self.apply_session_filter_checkbox.setEnabled(False)
+            self.apply_session_filter_checkbox.blockSignals(False)
+            self.apply_session_filter_checkbox.setToolTip(tr("tips.session_filter_my"))
+            self.session_container.hide()
+        elif asset_type in ["Crypto", "US Stock", "Futures - Global"]:
+            # Optional custom filtering
+            self.apply_session_filter_checkbox.blockSignals(True)
+            self.apply_session_filter_checkbox.setChecked(False) # Default OFF
+            self.apply_session_filter_checkbox.setEnabled(True)
+            self.apply_session_filter_checkbox.blockSignals(False)
+            self.apply_session_filter_checkbox.setToolTip(tr("tips.session_filter_custom"))
+            self.session_container.hide()
+
+    def _on_session_filter_toggled(self, checked):
+        """Handle session filter toggle."""
+        asset_type = self._get_selected_asset_type()
+        supports_custom = asset_type in ["Crypto", "US Stock", "Futures - Global"]
+        
+        if checked and supports_custom:
+            self.session_container.show()
+        else:
+            self.session_container.hide()
 
     def _on_fetch_clicked(self):
         try:
@@ -331,7 +469,13 @@ class FetcherTab(QWidget):
                 QMessageBox.warning(self, "日期错误", error_msg)
                 return
             
-            processed_code = self.fetcher.preprocess_code(raw_code, asset_type)
+            preprocess_info = self.fetcher.preprocess_code(raw_code, asset_type)
+            
+            # Unpack the string if it's returning the Phase 1 metadata dict
+            if isinstance(preprocess_info, dict):
+                processed_code = preprocess_info.get('processed_code', raw_code)
+            else:
+                processed_code = preprocess_info
             self.fetch_button.setEnabled(False)
             self.fetch_button.setText("获取中...")
             
@@ -348,37 +492,77 @@ class FetcherTab(QWidget):
                 proxy_url = self.proxy_url_input.text().strip()
             
             use_smart_update = self.incremental_update_checkbox.isChecked()
-            filter_lunch = self.filter_lunch_checkbox.isChecked()
+            apply_session_filter = self.apply_session_filter_checkbox.isChecked()
             
-            self.current_worker = FetchWorker(
-                asset_type, processed_code, timeframe, start_date, end_date,
-                exchange, proxy_url, use_smart_update, filter_lunch
+            custom_session = None
+            if apply_session_filter and self.session_container.isVisible():
+                 start_t = self.session_start.time()
+                 end_t = self.session_end.time()
+                 from datetime import time
+                 custom_session = (
+                     time(start_t.hour(), start_t.minute()),
+                     time(end_t.hour(), end_t.minute())
+                 )
+            
+            # Stability mode:
+            # Execute fetch synchronously in UI thread to avoid cross-thread
+            # native crashes observed in this environment.
+            self._run_fetch_sync(
+                asset_type=asset_type,
+                processed_code=processed_code,
+                timeframe=timeframe,
+                start_date=start_date,
+                end_date=end_date,
+                exchange=exchange,
+                proxy_url=proxy_url,
+                use_smart_update=use_smart_update,
+                apply_session_filter=apply_session_filter,
+                custom_session=custom_session,
             )
-            
-            self.current_worker.success.connect(self._on_fetch_success)
-            self.current_worker.error.connect(self._on_fetch_error)
-            self.current_worker.finished.connect(self._on_fetch_finished)
-            self.current_worker.start()
             
         except Exception as e:
             QMessageBox.critical(self, "程序错误", str(e))
             self.fetch_button.setEnabled(True)
             self.fetch_button.setText("获取数据 (Fetch Data)")
 
-    def _on_fetch_success(self, df, has_warning, warning_msg, csv_path):
-        self.current_df = df.copy()
-        self.data_grid.display_dataframe(df)
-        self.row_count_label.setText(f"共 {len(df)} 条数据")
+    def _on_fetch_success(self, payload, has_warning, warning_msg, csv_path):
+        import pickle
+        try:
+            # 1. Decode in-memory payload from worker thread.
+            if not isinstance(payload, (bytes, bytearray)):
+                raise TypeError(f"中转数据类型异常: {type(payload)}")
+            decoded = pickle.loads(payload)
+            if not isinstance(decoded, dict):
+                raise TypeError("中转数据结构异常")
+            columns = decoded.get("columns", [])
+            rows = decoded.get("rows", [])
+            row_count = int(decoded.get("row_count", len(rows)))
+                
+        except Exception as e:
+            self._on_fetch_error(f"无法从中转数据加载结果: {str(e)}")
+            return
+            
+        self.current_df = None
+        self.current_columns = list(columns)
+        self.current_rows = list(rows)
+        # Restore preview rendering (safe path using plain-Python records).
+        self.data_grid.display_records(self.current_columns, self.current_rows)
+        self.row_count_label.setText(f"共 {row_count} 条数据")
         self.export_csv_button.setEnabled(True)
         self.export_parquet_button.setEnabled(True)
+        self.save_db_button.setEnabled(True)
         
         if has_warning:
             self.status_banner.show_warning(warning_msg)
         else:
             self.status_banner.show_success(warning_msg + " | 点击 '导出' 保存")
+            
+        # Keep auto-processing disabled for now; it can be re-enabled after
+        # we confirm full stability on your machine.
+        # self._try_auto_process_data()
 
     def _on_fetch_error(self, error_msg):
-        self.status_banner.show_error(f"错误: {error_msg}")
+        self.status_banner.show_error(error_msg)
         self.data_grid.setRowCount(0)
         if "\n" in error_msg and len(error_msg) > 100:
              QMessageBox.warning(self, "数据获取错误", f"详细错误信息:\n\n{error_msg[:600]}")
@@ -387,24 +571,92 @@ class FetcherTab(QWidget):
         self.fetch_button.setEnabled(True)
         self.fetch_button.setText("获取数据 (Fetch Data)")
         if self.current_worker:
+            # Avoid blocking/re-entrancy around finished callback; thread is already done.
             self.current_worker.deleteLater()
             self.current_worker = None
-        self._try_auto_process_data()
+
+    def _run_fetch_sync(
+        self,
+        asset_type,
+        processed_code,
+        timeframe,
+        start_date,
+        end_date,
+        exchange,
+        proxy_url,
+        use_smart_update,
+        apply_session_filter,
+        custom_session,
+    ):
+        """Run fetch pipeline synchronously (threadless stability path)."""
+        from PyQt6.QtWidgets import QApplication
+        try:
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            QApplication.processEvents()
+
+            if use_smart_update:
+                df = self.fetcher.smart_update(
+                    symbol=processed_code,
+                    asset_type=asset_type,
+                    timeframe=timeframe,
+                    start_date=start_date,
+                    end_date=end_date,
+                    exchange=exchange,
+                    proxy_url=proxy_url,
+                )
+                if apply_session_filter:
+                    df = self.fetcher.apply_market_session_filter(df, asset_type, custom_session)
+            else:
+                df = self.fetcher.fetch_data(
+                    asset_type,
+                    processed_code,
+                    timeframe,
+                    start_date,
+                    end_date,
+                    exchange=exchange,
+                    proxy_url=proxy_url,
+                    filter_lunch=False,
+                )
+                if apply_session_filter:
+                    df = self.fetcher.apply_market_session_filter(df, asset_type, custom_session)
+
+            if df is None or df.empty:
+                self._on_fetch_error("未获取到任何数据。请检查资产代码和日期范围。")
+                return
+
+            has_warning, warning_msg = self.fetcher.analyze_gaps(df, start_date, end_date)
+            payload = {
+                "columns": list(df.columns),
+                "rows": df.where(df.notna(), None).to_dict(orient="records"),
+                "row_count": len(df),
+            }
+
+            import pickle
+            relay = pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL)
+            self._on_fetch_success(relay, has_warning, warning_msg, "")
+        except Exception as e:
+            self._on_fetch_error(str(e))
+        finally:
+            QApplication.restoreOverrideCursor()
+            self._on_fetch_finished()
 
     def _try_auto_process_data(self):
         from pathlib import Path
-        store_dir = Path("data/store")
-        fcpo_file = store_dir / "FCPO1!_15m.parquet"
-        zl_file = store_dir / "ZL1!_15m.parquet"
+        store_dir = Path("DataCenter/RawData")
         
-        if fcpo_file.exists() and zl_file.exists():
+        # Support deep folder structure (v2.6 Master DB Refactor)
+        fcpo_files = list(store_dir.rglob("*FCPO1!_15m.parquet"))
+        zl_files = list(store_dir.rglob("*ZL1!_15m.parquet"))
+        
+        if fcpo_files and zl_files:
             self.status_banner.show_info("正在生成对齐后的数据集...")
-            from core.data_processor import DataProcessor
-            processor = DataProcessor(store_dir="data/store", output_dir="data/processed")
+            from src.core.data_processor import DataProcessor
+            processor = DataProcessor(store_dir="DataCenter/RawData", output_dir="DataCenter/RawData/Align_data")
             # Logic to invoke processor can go here if needed as a separate thread or call
 
     def _on_export_clicked(self, format_type='csv'):
-        if self.current_df is None: return
+        if not self.current_rows:
+            return
         
         # This part requires access to file dialog. 
         # Since this logic might be better placed in main window or passed down,
@@ -423,11 +675,40 @@ class FetcherTab(QWidget):
         
         if file_path:
             try:
+                import pandas as pd
+                df = pd.DataFrame(self.current_rows, columns=self.current_columns)
                 if format_type == 'csv':
-                    self.current_df.to_csv(file_path)
+                    df.to_csv(file_path, index=False)
                 else:
-                    self.current_df.to_parquet(file_path)
+                    df.to_parquet(file_path, index=False)
                 QMessageBox.information(self, "导出成功", f"文件已保存至:\n{file_path}")
             except Exception as e:
                 QMessageBox.critical(self, "导出失败", str(e))
 
+    def _on_save_db_clicked(self):
+        """Save current data to Master DB (Data Center)."""
+        if not self.current_rows:
+            return
+        
+        try:
+            import pandas as pd
+            df = pd.DataFrame(self.current_rows, columns=self.current_columns)
+            # Determine asset type for folder structure
+            asset_type = self._get_selected_asset_type()
+            
+            # Call Facade to save
+            saved_path = self.fetcher.save_to_master_db(
+                df,
+                asset_type, 
+                self.current_code, 
+                self.current_timeframe
+            )
+            
+            self.status_banner.show_success(f"已保存至数据中心: {saved_path}")
+            QMessageBox.information(self, "保存成功", 
+                                  f"数据已成功保存至 Master DB！\n\n"
+                                  f"路径: {saved_path}\n"
+                                  f"您可以在 '数据管理中心' (Data Manager) 中查看。")
+            
+        except Exception as e:
+            QMessageBox.critical(self, "保存失败", f"无法保存到 Master DB:\n{str(e)}")

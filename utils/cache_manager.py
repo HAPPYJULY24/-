@@ -12,17 +12,19 @@ import pandas as pd
 class CacheManager:
     """缓存和临时文件管理器"""
     
-    STORE_DIR = "data/store"
+    STORE_DIR = "DataCenter/RawData"
     EXPORTED_DIR = "exported_data"
+    BACKTESTS_DIR = "DataCenter/Backtest_data"
+    RISK_AUDITS_DIR = "DataCenter/Risk_control_data"
     
     @staticmethod
     def get_master_db_info() -> Tuple[List[Dict], int, float]:
         """
-        获取Master DB统计信息
+        获取Master DB统计信息 (支持递归子目录 v2.6)
         
         Returns:
             Tuple of (file_list, total_files, total_size_mb)
-            - file_list: 文件信息列表 [{code, timeframe, rows, last_date, size_mb, filepath}, ...]
+            - file_list: 文件信息列表 [{category, code, timeframe, rows, last_date, size_mb, filepath}, ...]
             - total_files: 总文件数
             - total_size_mb: 总大小(MB)
         """
@@ -34,56 +36,96 @@ class CacheManager:
         file_list = []
         total_size = 0
         
-        for filename in os.listdir(store_dir):
-            if filename.endswith('.parquet'):
-                filepath = os.path.join(store_dir, filename)
+        # Use rglob for recursive search
+        from pathlib import Path
+        store_path = Path(store_dir)
+        
+        # Find all parquet files recursively
+        parquet_files = list(store_path.rglob('*.parquet'))
+        
+        for p_file in parquet_files:
+            filepath = str(p_file.absolute())
+            filename = p_file.name
+            
+            # 提取类别 Category，通过判断路径组成部分
+            category = "Unknown"
+            category_mapping = ["MYSTOCK", "US_Stock", "International_Futures_data", "Bursa_Futures_data", "CRYPTO_data", "Align_data"]
+            for part in p_file.parts:
+                if part in category_mapping:
+                    category = part
+                    break
+            
+            try:
+                # 获取文件大小
+                file_size = p_file.stat().st_size
+                total_size += file_size
                 
                 try:
-                    # 获取文件大小
-                    file_size = os.path.getsize(filepath)
-                    total_size += file_size
-                    
-                    # 读取parquet文件获取数据信息
+                    import pyarrow.parquet as pq
+                    metadata = pq.read_metadata(filepath)
+                    row_count = metadata.num_rows
                     df = pd.read_parquet(filepath)
-                    
-                    # 解析文件名：{code}_{timeframe}.parquet
-                    name_without_ext = filename.replace('.parquet', '')
+                except:
+                    # Fallback
+                    df = pd.read_parquet(filepath)
+                    row_count = len(df)
+                
+                # 解析文件名：{code}_{timeframe}.parquet
+                name_without_ext = filename.replace('.parquet', '')
+                
+                # Check if this is an aligned dataset which has custom naming
+                if category == 'Align_data' or 'ALIGNED' in p_file.parts:
+                    code = name_without_ext
+                    timeframe = "Aligned"
+                else:
                     parts = name_without_ext.rsplit('_', 1)
-                    
                     if len(parts) == 2:
                         code, timeframe = parts
                     else:
                         code = name_without_ext
                         timeframe = "Unknown"
-                    
-                    # 获取最新日期
-                    df['Date'] = pd.to_datetime(df['Date'])
-                    last_date = df['Date'].max()
-                    last_date_str = last_date.strftime('%Y-%m-%d') if pd.notna(last_date) else "N/A"
-                    
-                    # 数据行数
-                    row_count = len(df)
-                    
-                    file_list.append({
-                        'code': code,
-                        'timeframe': timeframe,
-                        'rows': row_count,
-                        'last_date': last_date_str,
-                        'size_mb': file_size / (1024 * 1024),  # Convert to MB
-                        'filepath': filepath
-                    })
-                    
-                except Exception as e:
-                    print(f"[WARNING] Failed to read {filename}: {str(e)}")
-                    # 即使读取失败，也添加基本信息
-                    file_list.append({
-                        'code': filename.replace('.parquet', ''),
-                        'timeframe': 'N/A',
-                        'rows': 0,
-                        'last_date': 'N/A',
-                        'size_mb': file_size / (1024 * 1024),
-                        'filepath': filepath
-                    })
+                
+                # 获取最新日期
+                last_date_str = "N/A"
+                if not df.empty:
+                    try:
+                        if 'Date' in df.columns:
+                            dates = pd.to_datetime(df['Date'])
+                            last_date = dates.max()
+                            last_date_str = last_date.strftime('%Y-%m-%d')
+                        elif isinstance(df.index, pd.DatetimeIndex):
+                            last_date = df.index.max()
+                            last_date_str = last_date.strftime('%Y-%m-%d')
+                        elif df.index.name == 'Date':
+                            dates = pd.to_datetime(df.index)
+                            last_date = dates.max()
+                            last_date_str = last_date.strftime('%Y-%m-%d')
+                    except Exception as date_e:
+                        print(f"[WARNING] Failed to extract date for {filename}: {str(date_e)}")
+                
+                file_list.append({
+                    'category': category,
+                    'code': code,
+                    'timeframe': timeframe,
+                    'rows': row_count,
+                    'last_date': last_date_str,
+                    'size_mb': file_size / (1024 * 1024),
+                    'size_bytes': file_size,
+                    'filepath': filepath
+                })
+                
+            except Exception as e:
+                print(f"[WARNING] Failed to read {filename}: {str(e)}")
+                file_list.append({
+                    'category': category,
+                    'code': filename.replace('.parquet', ''),
+                    'timeframe': 'N/A',
+                    'rows': 0,
+                    'last_date': 'N/A',
+                    'size_mb': 0,
+                    'size_bytes': 0,
+                    'filepath': filepath
+                })
         
         total_size_mb = total_size / (1024 * 1024)
         return file_list, len(file_list), total_size_mb
@@ -114,6 +156,36 @@ class CacheManager:
         return file_count, total_size_mb
     
     @staticmethod
+    def get_backtest_storage_dir() -> "Path":
+        """获取内部回测数据中心存储目录"""
+        from pathlib import Path
+        p = Path(CacheManager.BACKTESTS_DIR)
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    @staticmethod
+    def export_folder_to_zip(source_dir: str, target_base_path: str) -> Tuple[bool, str]:
+        """
+        将指定文件夹打包为 ZIP 文件
+        Args:
+            source_dir: 要打包的源文件夹路径
+            target_base_path: 目标ZIP文件的完整路径（不含 .zip 后缀，shutil.make_archive 会自动加）
+        Returns:
+            Tuple of (success, message)
+        """
+        try:
+            import shutil
+            import os
+            # Ensure target directory exists
+            os.makedirs(os.path.dirname(target_base_path), exist_ok=True)
+            zip_path = shutil.make_archive(target_base_path, 'zip', root_dir=source_dir)
+            return True, f"Successfully exported to {zip_path}"
+        except Exception as e:
+            error_msg = f"ZIP Export failed: {str(e)}"
+            print(f"[ERROR] {error_msg}")
+            return False, error_msg
+    
+    @staticmethod
     def delete_master_db_file(filepath: str) -> bool:
         """
         删除指定的Master DB文件
@@ -139,7 +211,7 @@ class CacheManager:
     @staticmethod
     def clear_all_master_db() -> Tuple[bool, str]:
         """
-        清空所有Master DB文件（危险操作！）
+        清空所有Master DB文件（递归清理）
         
         Returns:
             Tuple of (success, message)
@@ -151,11 +223,21 @@ class CacheManager:
         
         try:
             deleted_count = 0
-            for filename in os.listdir(store_dir):
-                if filename.endswith('.parquet'):
-                    filepath = os.path.join(store_dir, filename)
-                    os.remove(filepath)
+            from pathlib import Path
+            store_path = Path(store_dir)
+            
+            # Find all parquet files recursively
+            parquet_files = list(store_path.rglob('*.parquet'))
+            
+            for p_file in parquet_files:
+                try:
+                    p_file.unlink()
                     deleted_count += 1
+                except Exception as del_e:
+                    print(f"Failed to delete {p_file}: {del_e}")
+            
+            # Optionally remove empty subdirectories?
+            # For now, let's keep directories to avoid permission issues or confusion
             
             message = f"成功删除 {deleted_count} 个Master DB文件"
             print(f"[INFO] {message}")
@@ -513,3 +595,19 @@ class CacheManager:
             CacheManager.save_settings(settings)
         
         return success, message
+
+    @staticmethod
+    def get_backtest_storage_dir():
+        """Return and auto-create the backtests data directory."""
+        from pathlib import Path
+        p = Path(CacheManager.BACKTESTS_DIR)
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    @staticmethod
+    def get_risk_storage_dir():
+        """Return and auto-create the risk audit data directory."""
+        from pathlib import Path
+        p = Path(CacheManager.RISK_AUDITS_DIR)
+        p.mkdir(parents=True, exist_ok=True)
+        return p

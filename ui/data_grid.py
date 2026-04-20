@@ -5,7 +5,6 @@ Data Grid - Table widget for displaying first and last 5 rows of DataFrame.
 from PyQt6.QtWidgets import QTableWidget, QTableWidgetItem, QHeaderView
 from PyQt6.QtGui import QColor
 from PyQt6.QtCore import Qt
-import pandas as pd
 import math
 
 
@@ -48,83 +47,57 @@ class DataGrid(QTableWidget):
             }
         """)
     
-    def display_dataframe(self, df: pd.DataFrame):
-        """
-        Display first 5 and last 5 rows of DataFrame with highlighting.
-        
-        Args:
-            df: DataFrame to display
-        """
-        print(f"[DEBUG] DataGrid.display_dataframe called with {len(df)} rows")
-        
-        if df.empty:
+    def display_records(self, columns, rows):
+        """Display first 5 and last 5 rows from plain-Python rows."""
+        total_rows = len(rows)
+        print(f"[DEBUG] DataGrid.display_records called with {total_rows} rows")
+        if total_rows == 0:
             self.setRowCount(0)
             self.setColumnCount(0)
             return
+
+        show_separator = total_rows > 10
         
-        # Make a copy and reset index to avoid index conflicts
-        df_copy = df.copy().reset_index(drop=True)
-        
-        # Determine how many rows to show
-        total_rows = len(df_copy)
-        
-        if total_rows <= 10:
-            # Show all rows
-            display_df = df_copy.copy()
-            show_separator = False
+        row_payloads = []
+        if show_separator:
+            first_rows = rows[:5]
+            last_rows = rows[-5:]
+            row_payloads.extend(first_rows)
+            row_payloads.append({col: '...' for col in columns})
+            row_payloads.extend(last_rows)
         else:
-            # Show first 5 + separator + last 5
-            first_5 = df_copy.head(5).copy()
-            last_5 = df_copy.tail(5).copy()
-            
-            # Create separator row
-            separator_data = {col: '...' for col in df_copy.columns}
-            separator_df = pd.DataFrame([separator_data])
-            
-            # Reset indices before concatenation
-            first_5.reset_index(drop=True, inplace=True)
-            separator_df.reset_index(drop=True, inplace=True)
-            last_5.reset_index(drop=True, inplace=True)
-            
-            display_df = pd.concat([first_5, separator_df, last_5], ignore_index=True)
-            show_separator = True
+            row_payloads = rows
         
-        print(f"[DEBUG] Display DataFrame shape: {display_df.shape}, show_separator: {show_separator}")
+        print(f"[DEBUG] Display rows: {len(row_payloads)}, columns: {len(columns)}, show_separator: {show_separator}")
         
         # Set table dimensions
-        num_rows = len(display_df)
-        num_cols = len(display_df.columns)
+        num_rows = len(row_payloads)
+        num_cols = len(columns)
         
         self.setRowCount(num_rows)
         self.setColumnCount(num_cols)
         
         # Set column headers
-        self.setHorizontalHeaderLabels(display_df.columns.tolist())
+        self.setHorizontalHeaderLabels(columns)
         
         # Populate table
         for row_idx in range(num_rows):
             # Check if this is the separator row
             is_separator = show_separator and row_idx == 5
             
-            # Get original row data for highlighting logic
-            if not is_separator:
-                if show_separator:
-                    if row_idx < 5:
-                        # First 5 rows: row_idx maps directly
-                        orig_row_idx = row_idx
-                    else:
-                        # After separator (row 6-10): map to last 5 rows of original data
-                        # row_idx=6 -> orig_row_idx=239 (244-5)
-                        # row_idx=10 -> orig_row_idx=243 (244-1)
-                        orig_row_idx = total_rows - (num_rows - row_idx)
-                else:
-                    orig_row_idx = row_idx
-                
-                # Use df_copy instead of df to avoid index issues
-                orig_row = df_copy.iloc[orig_row_idx]
-            
-            for col_idx, col_name in enumerate(display_df.columns):
-                value = display_df.iloc[row_idx][col_name]
+            row_data = row_payloads[row_idx]
+            close_value = row_data.get('Close', "")
+            close_is_invalid = False
+            try:
+                close_str = str(close_value).lower()
+                close_is_invalid = close_str in ['nan', 'none', 'na', '']
+                if not close_is_invalid:
+                    close_is_invalid = math.isnan(float(close_value))
+            except (ValueError, TypeError):
+                close_is_invalid = close_is_invalid or close_value is None
+
+            for col_idx, col_name in enumerate(columns):
+                value = row_data.get(col_name, "")
                 
                 # Create table item
                 item = QTableWidgetItem(str(value))
@@ -134,14 +107,16 @@ class DataGrid(QTableWidget):
                 if not is_separator:
                     should_highlight = False
                     
-                    # Check if Volume == 0
-                    if col_name == 'Volume' and value == 0:
+                    # Highlight volume only when zero volume accompanies invalid close.
+                    if col_name == 'Volume' and (value == 0 or value == '0') and close_is_invalid:
                         should_highlight = True
                     
                     # Check if Close is NaN
                     if col_name == 'Close':
                         try:
-                            if pd.isna(orig_row['Close']) or math.isnan(float(value)):
+                            # Use string-based or float-based checks on the cell value itself
+                            val_str = str(value).lower()
+                            if val_str in ['nan', 'none', 'na'] or math.isnan(float(value)):
                                 should_highlight = True
                         except (ValueError, TypeError):
                             pass
@@ -161,3 +136,15 @@ class DataGrid(QTableWidget):
         
         # Adjust row heights
         self.resizeRowsToContents()
+
+    def display_dataframe(self, df):
+        """
+        Backward-compatible wrapper. Prefer `display_records`.
+        """
+        try:
+            columns = list(df.columns)
+            rows = df.where(df.notna(), None).to_dict(orient='records')
+            self.display_records(columns, rows)
+        except Exception:
+            self.setRowCount(0)
+            self.setColumnCount(0)

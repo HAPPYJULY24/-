@@ -5,7 +5,11 @@ Main Window - Primary application interface for Quant Data Bridge.
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QTabWidget,
                              QLabel, QMessageBox)
 from PyQt6.QtGui import QFont
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QCoreApplication
+import sys
+
+# Localization
+from logic.localization import tr
 
 from .tabs.fetcher_tab import FetcherTab
 from .tabs.risk_tab import RiskTab
@@ -27,7 +31,7 @@ class MainWindow(QMainWindow):
     
     def _init_ui(self):
         """Initialize the user interface."""
-        self.setWindowTitle("Quant Data Bridge")
+        self.setWindowTitle(tr("mainwindow.title"))
         self.setMinimumSize(1000, 800)
         
         # Create menu bar
@@ -43,7 +47,7 @@ class MainWindow(QMainWindow):
         main_layout.setContentsMargins(10, 10, 10, 10)
         
         # Title
-        title = QLabel("Quant Data Bridge")
+        title = QLabel(tr("mainwindow.main_title"))
         title_font = QFont()
         title_font.setPointSize(18)
         title_font.setBold(True)
@@ -62,14 +66,14 @@ class MainWindow(QMainWindow):
         self.backtest_tab = BacktestTab()
         
         # Add Tabs
-        self.tabs.addTab(self.fetcher_tab, "📡 Data Fetcher")
-        self.tabs.addTab(self.risk_tab, "🛡️ Risk Control")
-        self.tabs.addTab(self.alpha_tab, "🧪 Alpha Research")
-        self.tabs.addTab(self.backtest_tab, "📈 Backtest Engine")
+        self.tabs.addTab(self.fetcher_tab, tr("tabs.data_fetcher"))
+        self.tabs.addTab(self.risk_tab, tr("tabs.risk_control"))
+        self.tabs.addTab(self.alpha_tab, tr("tabs.alpha_research"))
+        self.tabs.addTab(self.backtest_tab, tr("tabs.backtest_engine"))
         
         # Data Manager Button (Corner Widget)
         from PyQt6.QtWidgets import QPushButton
-        self.btn_data_manager = QPushButton("📂 Data Manager")
+        self.btn_data_manager = QPushButton(tr("mainwindow.data_manager_btn"))
         self.btn_data_manager.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_data_manager.setStyleSheet("""
             QPushButton {
@@ -96,17 +100,21 @@ class MainWindow(QMainWindow):
         menubar = self.menuBar()
         
         # Settings Menu
-        settings_menu = menubar.addMenu("⚙️ 设置 (Settings)")
+        settings_menu = menubar.addMenu(tr("menu.settings"))
+        
+        # Language Settings
+        language_settings_action = settings_menu.addAction(tr("menu.language_settings"))
+        language_settings_action.triggered.connect(self._open_language_settings)
         
         # TradingView Config
-        tv_settings_action = settings_menu.addAction("🔐 TradingView 配置")
+        tv_settings_action = settings_menu.addAction(tr("menu.tv_config"))
         tv_settings_action.triggered.connect(self._open_settings)
         
-        # Tools Menu (Keeping purely for legacy/backup access, though tabs replace this)
-        tools_menu = menubar.addMenu("🔧 工具 (Tools)")
+        # Tools Menu
+        tools_menu = menubar.addMenu(tr("menu.tools"))
         
-        # Data Alignment Studio (Legacy Action)
-        alignment_action = tools_menu.addAction("🔬 Data Alignment Studio (Dialog)")
+        # Data Alignment Studio
+        alignment_action = tools_menu.addAction(tr("menu.data_alignment"))
         alignment_action.setStatusTip("Open Data Alignment Studio Dialog")
         alignment_action.triggered.connect(self._open_alignment_dialog)
 
@@ -128,8 +136,8 @@ class MainWindow(QMainWindow):
             if is_low:
                 reply = QMessageBox.warning(
                     self,
-                    "磁盘空间警告",
-                    f"{msg}\n\n建议清理旧数据释放空间。\n\n是否打开数据管理中心？",
+                    tr("mainwindow.disk_warning_title"),
+                    tr("mainwindow.disk_warning_message", msg=msg),
                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
                 )
                 
@@ -141,11 +149,25 @@ class MainWindow(QMainWindow):
         except Exception as e:
             print(f"[ERROR] Startup checks failed: {str(e)}")
 
-    def _open_settings(self):
-        """Open settings dialog."""
+    def _open_language_settings(self):
+        """Open language settings dialog."""
         from .settings_dialog import SettingsDialog
         
         dialog = SettingsDialog(self)
+        dialog.exec()
+    
+    def _restart_application(self):
+        """Restart the application."""
+        QCoreApplication.quit()
+        # Restart using sys.executable
+        import os
+        os.execl(sys.executable, sys.executable, *sys.argv)
+    
+    def _open_settings(self):
+        """Open settings dialog."""
+        from .tv_settings_dialog import TvSettingsDialog
+        
+        dialog = TvSettingsDialog(self)
         if dialog.exec():
             QMessageBox.information(
                 self,
@@ -162,7 +184,7 @@ class MainWindow(QMainWindow):
         except Exception as e:
             import traceback
             traceback.print_exc()
-            QMessageBox.critical(self, "启动错误", f"无法打开工具:\n\n{str(e)}")
+            QMessageBox.critical(self, tr("mainwindow.error_title"), tr("mainwindow.error_message", error=str(e)))
             
     def _on_data_manager_clicked(self):
         """Open data manager dialog directly."""

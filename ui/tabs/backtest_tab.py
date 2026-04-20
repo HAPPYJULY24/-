@@ -1,7 +1,7 @@
 
-from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
-                             QPushButton, QComboBox, QGroupBox, QFormLayout, 
-                             QDoubleSpinBox, QSplitter, QTableWidget, QTableWidgetItem, 
+from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
+                             QPushButton, QComboBox, QGroupBox, QFormLayout,
+                             QDoubleSpinBox, QSplitter, QTableWidget, QTableWidgetItem,
                              QHeaderView, QMessageBox, QSpinBox, QTabWidget, QCheckBox, QFileDialog)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QFont, QColor
@@ -10,13 +10,18 @@ import matplotlib
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 import os
+import json
+import uuid
 from pathlib import Path
+from datetime import datetime, timezone
 
 # Set backend
 matplotlib.use('QtAgg')
 plt.style.use('dark_background')
 
-from core.backtest_engine import BacktestEngine
+from src.quant_bridge import BacktestEngine
+from ui.widgets.backtest_charts import BacktestCharts
+
 
 class BacktestWorker(QThread):
     """
@@ -38,41 +43,64 @@ class BacktestWorker(QThread):
         try:
             # Load Data
             df = pd.read_parquet(self.data_path)
-            
+            p  = self.params
+
             if self.task_type == 'run':
-                # 1. Run Standard Backtest
-                results = self.engine.run_backtest(
-                    df, 
-                    multiplier=self.params['multiplier'],
-                    commission=self.params['commission'],
-                    slippage=self.params['slippage'],
-                    initial_capital=self.params['initial_capital'],
-                    upper_bound=self.params['upper_bound'],
-                    lower_bound=self.params['lower_bound'],
-                    initial_margin=self.params['initial_margin'],
-                    maintenance_margin_rate=0.8,
-                    allow_lunch=self.params['allow_lunch'],
-                    allow_overnight=self.params['allow_overnight'],
-                    execution_mode=self.params.get('execution_mode', 'Close'),
-                    risk_target=self.params.get('risk_target', 0.0),
-                    sl_pct=self.params.get('sl_pct', 0.0),
-                    use_adx_filter=self.params.get('use_adx_filter', False),
-                    max_lots=self.params.get('max_lots', 20)
+                # ── Build RiskConfig from UI params (no JSON needed) ──────────
+                from logic.risk_manager_interceptor import (
+                    RiskManager as RMInterceptor, RiskConfig)
+                config = RiskConfig(
+                    initial_capital    = p['initial_capital'],
+                    initial_margin     = p['initial_margin'],
+                    risk_target_pct    = p.get('risk_target', 1.0),
+                    max_position_size  = p.get('max_lots', 20),
+                    multiplier         = p['multiplier'],
+                    adx_filter_enabled = p.get('use_adx_filter', False)
                 )
-                
-                # 2. Run Audit (Lookahead Bias)
-                audit_res = self.engine.audit_lookahead(df, self.params)
+                RMClass = lambda *a, **kw: RMInterceptor(config)
+
+                # ── Generate signals ──────────────────────────────────────────
+                from src.core.signal_generator import SignalFactory
+                df['signal'] = SignalFactory.create(
+                    p.get('strategy', 'Mean Reversion')
+                ).generate(df,
+                    upper_bound=p['upper_bound'],
+                    lower_bound=p['lower_bound'])
+
+                # ── Run via event_driven.run() — same call-site as Risk Tab ───
+                results = self.engine.event_driven.run(
+                    df=df,
+                    asset_symbol="BACKTEST",
+                    RiskManagerClass=RMClass,
+                    multiplier=p['multiplier'],
+                    commission=p['commission'],
+                    slippage=p['slippage'],
+                    initial_capital=p['initial_capital'],
+                    initial_margin=p['initial_margin'],
+                    maintenance_margin_rate=0.8,
+                    allow_lunch=p['allow_lunch'],
+                    allow_overnight=p['allow_overnight'],
+                    execution_mode=p.get('execution_mode', 'Close'),
+                    risk_params={'max_lots': p.get('max_lots', 20)}
+                )
+
+                # ── Lookahead audit (fast vectorized sub-run) ─────────────────
+                audit_res = self.engine.audit_lookahead(df, p)
                 results['audit'] = audit_res
-                
-                # 3. Generate Trade Log
-                trade_log = self.engine.generate_trade_log(results['equity_curve'])
-                results['trade_log'] = trade_log
-                
+
+                # ── Trade log forwarding ──────────────────────────────────────
+                if 'trades' in results and not results['trades'].empty:
+                    results['trade_log'] = results['trades']
+                else:
+                    trade_log = self.engine.generate_trade_log(results['equity_curve'])
+                    results['trade_log'] = trade_log
+
                 self.finished.emit(results)
+
                 
             elif self.task_type == 'sensitivity':
                 # Run Slippage Sensitivity
-                sens_res = self.engine.run_sensitivity_test(df, self.params)
+                sens_res = self.engine.run_pressure_test(df, self.params)
                 self.sensitivity_finished.emit(sens_res)
             
         except Exception as e:
@@ -88,6 +116,11 @@ class BacktestTab(QWidget):
         super().__init__()
         self.init_ui()
         self.current_results = None
+        # Snapshot of params used for the LAST completed backtest run.
+        # This is set in _run_backtest() BEFORE the worker starts,
+        # ensuring DNA always matches the actual Trade Log (anti state-mismatch).
+        self._last_run_params: dict = {}
+        self._last_signal_path: str = ""
         
     def init_ui(self):
         main_layout = QHBoxLayout()
@@ -154,6 +187,10 @@ class BacktestTab(QWidget):
         # 3. Strategy Parameters
         strat_group = QGroupBox("Strategy Params")
         strat_layout = QFormLayout()
+        
+        self.strategy_combo = QComboBox()
+        self.strategy_combo.addItems(["Mean Reversion", "Momentum Breakout"])
+        strat_layout.addRow("Strategy Type:", self.strategy_combo)
         
         self.capital_spin = QDoubleSpinBox()
         self.capital_spin.setRange(1000, 10000000)
@@ -249,7 +286,7 @@ class BacktestTab(QWidget):
         
         header_layout.addStretch()
         
-        self.export_btn = QPushButton("💾 Export Trade Log")
+        self.export_btn = QPushButton("💾 Export Backtest Info")
         self.export_btn.setEnabled(False) # Enabled after run
         self.export_btn.clicked.connect(self._export_trade_log)
         header_layout.addWidget(self.export_btn)
@@ -271,7 +308,7 @@ class BacktestTab(QWidget):
         # Sensitivity Table (Initially Hidden or Small)
         self.sens_table = QTableWidget()
         self.sens_table.setColumnCount(4)
-        self.sens_table.setHorizontalHeaderLabels(["Slippage", "Net Profit", "Calmar", "Trades"])
+        self.sens_table.setHorizontalHeaderLabels(["Slippage", "Net Profit", "MDD (%)", "Trades"])
         self.sens_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.sens_table.verticalHeader().setVisible(False)
         self.sens_table.setAlternatingRowColors(True)
@@ -283,32 +320,11 @@ class BacktestTab(QWidget):
         right_layout.addWidget(metrics_splitter)
         right_layout.setStretchFactor(metrics_splitter, 1) # Small portion for metrics
         
-        # Charts Tabs
-        self.chart_tabs = QTabWidget()
+        # Charts Widget (Phase 5B.1: Extracted to separate widget)
+        self.charts = BacktestCharts()
         
-        # 1. Equity Curve
-        self.equity_fig = plt.figure()
-        self.equity_canvas = FigureCanvas(self.equity_fig)
-        self.chart_tabs.addTab(self.equity_canvas, "Equity Curve")
-        
-        # 2. Position Plot
-        self.pos_fig = plt.figure()
-        self.pos_canvas = FigureCanvas(self.pos_fig)
-        self.chart_tabs.addTab(self.pos_canvas, "Position Analysis")
-        
-        # 3. Drawdown
-        self.dd_fig = plt.figure()
-        self.dd_fig.clear() # Clear before init to be safe? No, just create new.
-        self.dd_canvas = FigureCanvas(self.dd_fig)
-        self.chart_tabs.addTab(self.dd_canvas, "Drawdown")
-        
-        # 4. Risk Indicators (Phase 5.2)
-        self.risk_fig = plt.figure()
-        self.risk_canvas = FigureCanvas(self.risk_fig)
-        self.chart_tabs.addTab(self.risk_canvas, "Risk Indicators")
-        
-        right_layout.addWidget(self.chart_tabs)
-        right_layout.setStretchFactor(self.chart_tabs, 3) # Larger portion for charts
+        right_layout.addWidget(self.charts)
+        right_layout.setStretchFactor(self.charts, 3) # Larger portion for charts
         
         main_layout.addWidget(right_panel)
         
@@ -318,15 +334,19 @@ class BacktestTab(QWidget):
         self.refresh_files()
         
     def refresh_files(self):
-        """Scan data/signals/"""
-        path = Path("data/signals")
+        """Scan DataCenter/Alpha_data/"""
+        path = Path("DataCenter/Alpha_data")
         if not path.exists():
             path.mkdir(parents=True, exist_ok=True)
             
-        files = list(path.glob("*.parquet"))
+        files = list(path.rglob("*.parquet"))
         self.file_combo.clear()
         if files:
-            self.file_combo.addItems([f.name for f in files])
+            # Store relative paths so that the combobox shows parent folder + filename
+            # e.g., STG_001_MyAlpha/STG_001_data.parquet
+            for f in files:
+                rel_path = str(f.relative_to(path))
+                self.file_combo.addItem(rel_path, str(f))
         else:
             self.file_combo.addItem("No signals found")
             self.run_btn.setEnabled(False)
@@ -341,13 +361,14 @@ class BacktestTab(QWidget):
             'multiplier': self.multiplier_spin.value(),
             'commission': self.commission_spin.value(),
             'slippage': self.slippage_spin.value(),
+            'strategy': self.strategy_combo.currentText(),
             'initial_capital': self.capital_spin.value(),
             'upper_bound': self.upper_bound.value(),
             'lower_bound': self.lower_bound.value(),
             'initial_margin': self.margin_spin.value(),
             'allow_overnight': self.intraday_chk.isChecked(),
             'allow_lunch': self.lunch_chk.isChecked(),
-            'execution_mode': 'Next Open' if "Next Open" in self.exec_mode_combo.currentText() else 'Close',
+            'execution_mode': self.exec_mode_combo.currentText(),
             'risk_target': self.risk_target.value(),
             'sl_pct': self.sl_pct.value(),
             'use_adx_filter': self.adx_chk.isChecked(),
@@ -357,14 +378,50 @@ class BacktestTab(QWidget):
     def _run_backtest(self):
         filename = self.file_combo.currentText()
         if not filename or filename == "No signals found": return
-        path = str(Path("data/signals") / filename)
         
+        # Pull absolute path from the combo item's hidden data
+        path = self.file_combo.currentData()
+        if not path:
+            # Fallback just in case
+            path = str(Path("DataCenter/Alpha_data") / filename)
+            
+        import os
+        from src.core.models.strategy_config import StrategyConfig
+        
+        # 1. 自动读取与装载 (Load)
+        json_path = path.replace('_data.parquet', '_config.json')
+        configurator = None
+        if os.path.exists(json_path):
+            try:
+                configurator = StrategyConfig.from_json(json_path)
+                
+                # Check Lock State
+                if configurator.metadata.status == "PRODUCTION_READY":
+                    reply = QMessageBox.question(
+                        self, 
+                        "状态锁警告 (Status Lock)", 
+                        "该策略当前状态为 PRODUCTION_READY，通常禁止修改。\n\n您确定要强行重新回测并覆盖现有的质检结果吗？", 
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                    )
+                    if reply != QMessageBox.StandardButton.Yes:
+                        return
+                        
+            except Exception as e:
+                QMessageBox.critical(self, "Parse Error", f"Cannot parse strategy DNA: {e}")
+                return
+
         params = self._get_params()
-        
+
+        # === SNAPSHOT: capture run-time state BEFORE worker starts ===
+        # DNA will read from these frozen snapshots, NOT from live UI controls.
+        self._last_run_params = dict(params)
+        self._last_signal_path = path
+        self._last_json_path = json_path if os.path.exists(json_path) else None
+
         self.run_btn.setEnabled(False)
         self.run_btn.setText("⏳ Running...")
-        self.audit_label.setText("") 
-        
+        self.audit_label.setText("")
+
         self.worker = BacktestWorker(path, params, task_type='run')
         self.worker.finished.connect(self._on_finished)
         self.worker.error.connect(self._on_error)
@@ -373,7 +430,10 @@ class BacktestTab(QWidget):
     def _run_pressure_test(self):
         filename = self.file_combo.currentText()
         if not filename or filename == "No signals found": return
-        path = str(Path("data/signals") / filename)
+        
+        path = self.file_combo.currentData()
+        if not path:
+            path = str(Path("DataCenter/Alpha_data") / filename)
         
         params = self._get_params()
         
@@ -388,6 +448,14 @@ class BacktestTab(QWidget):
     def _on_finished(self, results):
         self.run_btn.setEnabled(True)
         self.run_btn.setText("🚀 Run Backtest")
+        
+        # Robust Cleanup: Wait for the thread to fully exit its C++ loop before destroying
+        if hasattr(self, 'worker') and self.worker:
+            self.worker.wait()
+            self.worker.deleteLater()
+            self.worker = None
+            
+        self.audit_label.setText("✅ Backtest Finished")
         self.current_results = results
         self.export_btn.setEnabled(True)
         
@@ -413,6 +481,55 @@ class BacktestTab(QWidget):
             QMessageBox.warning(self, "Risk Warning", f"Strategy triggered a {status}")
         else:
             QMessageBox.information(self, "Backtest Complete", "Backtest finished successfully!")
+            
+        # ========================================================
+        # Phase 2: Baton Relay State Transition (Update Profile)
+        # ========================================================
+        import os
+        from src.core.models.strategy_config import StrategyConfig
+        
+        json_path = getattr(self, '_last_json_path', None)
+        if json_path and os.path.exists(json_path):
+            try:
+                # 1. Deserialize
+                config = StrategyConfig.from_json(json_path)
+                
+                # 2. Update Profile & Embed Metrics
+                config.backtest_profile.settings = self._last_run_params
+                
+                # Safe-copy primitives out of the metrics dict to avoid serialization issues
+                clean_metrics = {}
+                for k, v in results.get('metrics', {}).items():
+                    if isinstance(v, (int, float, str, bool)):
+                        clean_metrics[k] = v
+                    elif hasattr(v, 'item'):  # Handle numpy types cleanly
+                        clean_metrics[k] = v.item()
+                    else:
+                        clean_metrics[k] = str(v)
+                config.backtest_profile.metrics = clean_metrics
+                
+                # 3. State Transition: Enforce minimum state upgrades
+                if config.metadata.status == "ALPHA_DRAFT":
+                    config.metadata.status = "BACKTESTED"
+                
+                # Overwrite DNA
+                config.to_json(json_path)
+                
+                # 4. Dump Trade Log CSV into the same folder
+                trades_df = results.get('trades')
+                if trades_df is not None and not trades_df.empty:
+                    folder_path = Path(self._last_signal_path).parent
+                    stg_id = config.metadata.strategy_id
+                    trades_df.to_csv(folder_path / f"{stg_id}_tradelog.csv", index=False)
+                
+                # Update UI Alert Banner to confirm Relay
+                self.audit_label.setText(self.audit_label.text() + " | 🔋 Baton Relay: UPDATED")
+                
+            except Exception as e:
+                print(f"[ERROR] Baton Relay Phase 2 save failed: {e}")
+                import traceback
+                traceback.print_exc()
+                QMessageBox.warning(self, "Relay Update Error", f"Failed to save backtest signature mapping to DNA:\n{e}")
         
     def _on_sensitivity_finished(self, results):
         self.pressure_btn.setEnabled(True)
@@ -422,7 +539,7 @@ class BacktestTab(QWidget):
         for i, res in enumerate(results):
             self.sens_table.setItem(i, 0, QTableWidgetItem(str(res['Slippage'])))
             self.sens_table.setItem(i, 1, QTableWidgetItem(f"{res['Net Profit']:,.0f}"))
-            self.sens_table.setItem(i, 2, QTableWidgetItem(f"{res['Calmar']:.2f}"))
+            self.sens_table.setItem(i, 2, QTableWidgetItem(f"{res.get('MDD (%)', 0.0):.2f}"))
             self.sens_table.setItem(i, 3, QTableWidgetItem(str(res['Trades'])))
             
         QMessageBox.information(self, "Pressure Test", "Slippage Sensitivity Test Complete!")
@@ -443,22 +560,160 @@ class BacktestTab(QWidget):
         else:
             QMessageBox.critical(self, "Error", msg)
             
+    def _read_signal_metadata(self, parquet_path: str) -> dict:
+        """
+        Read universe (symbol) and timeframe from the Parquet file's key-value metadata.
+        Falls back to filename stem parsing if metadata is absent or unreadable.
+        """
+        try:
+            import pyarrow.parquet as pq
+            raw_meta = pq.read_schema(parquet_path).metadata or {}
+            universe = raw_meta.get(b"symbol", b"").decode().strip()
+            timeframe = raw_meta.get(b"timeframe", b"").decode().strip()
+            if universe and timeframe:
+                return {"universe": universe, "timeframe": timeframe}
+        except Exception:
+            pass
+
+        # Fallback: parse filename stem (e.g. "FCPO1!_5m" → symbol="FCPO1!", tf="5m")
+        stem = Path(parquet_path).stem
+        parts = stem.rsplit("_", 1)
+        return {
+            "universe": parts[0] if len(parts) == 2 else stem,
+            "timeframe": parts[1] if len(parts) == 2 else "unknown",
+        }
+
+    def generate_strategy_dna(self) -> dict:
+        """
+        Build the strategy_dna dict from the FROZEN snapshot captured at
+        backtest run-time (_last_run_params). Never reads from live UI controls.
+        """
+        p = self._last_run_params
+        if not p:
+            raise RuntimeError("No backtest has been run yet. Cannot generate Strategy DNA.")
+
+        signal_meta = self._read_signal_metadata(self._last_signal_path)
+        sl_pct = p.get('sl_pct', 0.0)
+        stop_loss_type = "Intra-bar SL" if sl_pct > 0 else "None"
+
+        return {
+            "identification": {
+                "strategy_id": str(uuid.uuid4())[:8].upper(),
+                "backtest_version": "v1.0",
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            },
+            "environment": {
+                "universe": [signal_meta["universe"]],
+                "timeframe": signal_meta["timeframe"],
+                "initial_capital": p.get('initial_capital', 0.0),
+                "currency": "RM"
+            },
+            "alpha_configuration": {
+                "factor_expression": p.get('strategy', 'unknown'),
+                "preprocessing_params": {
+                    "winsorize_limit": 0.05,
+                    "neutralization": False,
+                    "standardization": "z-score"
+                }
+            },
+            "optimized_decision_parameters": {
+                "entry_threshold": p.get('upper_bound', 0.0),
+                "exit_threshold": p.get('lower_bound', 0.0),
+                "rebalance_mode": "signal_driven",
+                "order_type": "market",
+                "execution_mode": p.get('execution_mode', 'Close')
+            },
+            "execution_constraints": {
+                "allow_overnight": p.get('allow_overnight', True),
+                "allow_lunch": p.get('allow_lunch', True),
+                "adx_filter_enabled": p.get('use_adx_filter', False)
+            },
+            "friction_costs": {
+                "multiplier": p.get('multiplier', 0.0),
+                "commission_per_lot": p.get('commission', 0.0),
+                "slippage_ticks": p.get('slippage', 0.0)
+            },
+            "backtest_risk_settings": {
+                "stop_loss_type": stop_loss_type,
+                "stop_loss_value": sl_pct,
+                "take_profit_value": 0.0,
+                "max_position_size": p.get('max_lots', 20),
+                "leverage_limit": 1.0,
+                "initial_margin": p.get('initial_margin', 0.0),
+                "risk_target_pct": p.get('risk_target', 0.0)
+            }
+        }
+
     def _export_trade_log(self):
         if not self.current_results or 'trade_log' not in self.current_results:
             return
-            
+
         df = self.current_results['trade_log']
         if df.empty:
             QMessageBox.information(self, "Export", "No trades were generated.")
             return
 
-        filename, _ = QFileDialog.getSaveFileName(self, "Export Trade Log", "trade_log.csv", "CSV Files (*.csv)")
-        if filename:
-            try:
-                df.to_csv(filename, index=False)
-                QMessageBox.information(self, "Success", f"Trade log exported to:\n{filename}")
-            except Exception as e:
-                QMessageBox.critical(self, "Export Error", str(e))
+        from ui.export_backtest_dialog import ExportBacktestDialog
+        from utils.cache_manager import CacheManager
+        import shutil
+
+        dialog = ExportBacktestDialog(self)
+        if dialog.exec() != dialog.DialogCode.Accepted:
+            return
+            
+        export_data = dialog.get_export_data()
+        folder_name = export_data['folder_name']
+        trade_log_base = export_data['trade_log_base']
+        dna_base = export_data['dna_base']
+        save_mode = export_data['save_mode']
+
+        try:
+            # 1. Determine local_dir if needed
+            local_dir_path = None
+            if save_mode in ['local', 'both']:
+                local_dir_path = QFileDialog.getExistingDirectory(
+                    self, "Select Local Export Directory", "", QFileDialog.Option.ShowDirsOnly
+                )
+                if not local_dir_path:
+                    # User canceled directory selection
+                    return
+            
+            # 2. Prepare DNA
+            dna = self.generate_strategy_dna()
+            
+            # 3. Create folders and write files
+            paths_created = []
+            trade_log_filename = f"{trade_log_base}.csv" # Dynamic extension fallback
+            dna_filename = f"{dna_base}.json"
+            
+            dc_path = CacheManager.get_backtest_storage_dir() / folder_name
+            
+            if save_mode in ['data_center', 'both']:
+                dc_path.mkdir(parents=True, exist_ok=True)
+                df.to_csv(str(dc_path / trade_log_filename), index=False)
+                with open(dc_path / dna_filename, "w", encoding="utf-8") as f:
+                    json.dump(dna, f, indent=2, ensure_ascii=False)
+                paths_created.append(f"Data Center:\n{dc_path}")
+                
+            if save_mode in ['local', 'both']:
+                local_path = Path(local_dir_path) / folder_name
+                local_path.mkdir(parents=True, exist_ok=True)
+                
+                if save_mode == 'both':
+                    shutil.copy2(str(dc_path / trade_log_filename), str(local_path / trade_log_filename))
+                    shutil.copy2(str(dc_path / dna_filename), str(local_path / dna_filename))
+                else:
+                    df.to_csv(str(local_path / trade_log_filename), index=False)
+                    with open(local_path / dna_filename, "w", encoding="utf-8") as f:
+                        json.dump(dna, f, indent=2, ensure_ascii=False)
+                
+                paths_created.append(f"Local Export:\n{local_path}")
+            
+            msg = "Successfully exported Backtest Info to:\n\n" + "\n\n".join(paths_created)
+            QMessageBox.information(self, "Export Successful", msg)
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Export Error", str(e))
         
     def _update_metrics(self, metrics):
         # Flatten metrics into grid
@@ -484,65 +739,5 @@ class BacktestTab(QWidget):
                 self.metrics_table.setItem(i, 3, QTableWidgetItem(""))
 
     def _update_charts(self, results):
-        df = results['equity_curve']
-        
-        # 1. Equity Curve & Margin Line
-        self.equity_fig.clear()
-        ax1 = self.equity_fig.add_subplot(111)
-        ax1.plot(df.index, df['equity'], color='#4CAF50', linewidth=2, label='Equity')
-        
-        # Plot Maintenance Level (Red Line)
-        if 'maint_level' in df.columns:
-             ax1.plot(df.index, df['maint_level'], color='#FF5252', linestyle='--', linewidth=1, label='Margin Call Level')
-             
-        ax1.set_title("Equity Curve (RM)")
-        ax1.legend()
-        ax1.grid(True, alpha=0.3)
-        self.equity_fig.autofmt_xdate()
-        self.equity_canvas.draw()
-        
-        # 2. Position Plot (Step Chart)
-        self.pos_fig.clear()
-        ax2 = self.pos_fig.add_subplot(111)
-        # Plot signal/position
-        ax2.step(df.index, df['pos'], where='post', color='#2196F3', linewidth=1.5)
-        ax2.set_yticks([-1, 0, 1])
-        ax2.set_yticklabels(['Short', 'Neutral', 'Long'])
-        ax2.set_title("Position Status")
-        ax2.grid(True, alpha=0.3)
-        self.pos_fig.autofmt_xdate()
-        self.pos_canvas.draw()
-        
-        # 3. Drawdown Area
-        self.dd_fig.clear()
-        ax3 = self.dd_fig.add_subplot(111)
-        ax3.fill_between(df.index, df['drawdown_pct'] * 100, 0, color='#FF5252', alpha=0.6)
-        ax3.set_title("Drawdown (%)")
-        ax3.set_ylabel("Drawdown %")
-        ax3.grid(True, alpha=0.3)
-        self.dd_fig.autofmt_xdate()
-        self.dd_fig.autofmt_xdate()
-        self.dd_canvas.draw()
-        
-        # 4. Risk Indicators (ATR/ADX)
-        self.risk_fig.clear()
-        ax4 = self.risk_fig.add_subplot(111)
-        
-        has_risk_data = False
-        if 'atr' in df.columns:
-            ax4.plot(df.index, df['atr'], label='ATR(14)', color='cyan', linewidth=1.5)
-            has_risk_data = True
-            
-        if 'adx' in df.columns:
-            ax4_2 = ax4.twinx()
-            ax4_2.plot(df.index, df['adx'], label='ADX(14)', color='magenta', linestyle='--', linewidth=1.5)
-            ax4_2.axhline(20, color='gray', linestyle=':', alpha=0.5)
-            ax4_2.legend(loc='upper right')
-            has_risk_data = True
-        
-        if has_risk_data:
-            ax4.set_title("Risk Indicators (ATR & ADX)")
-            ax4.legend(loc='upper left')
-            ax4.grid(True, alpha=0.3)
-            self.risk_fig.autofmt_xdate()
-            self.risk_canvas.draw()
+        """Update all charts using BacktestCharts widget."""
+        self.charts.update_all_charts(results)

@@ -19,7 +19,16 @@ from pathlib import Path
 matplotlib.use('QtAgg')
 plt.style.use('dark_background')  # Force dark mode friendly charts
 
-from core.alpha_engine import AlphaEngine
+from src.quant_bridge import AlphaEngine
+from ui.widgets.alpha_charts import AlphaCharts
+from utils.cache_manager import CacheManager
+from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
+                             QPushButton, QComboBox, QPlainTextEdit, QGroupBox, 
+                             QFormLayout, QDoubleSpinBox, QSplitter, 
+                             QTableWidget, QTableWidgetItem, QHeaderView, QListWidget, QListWidgetItem,
+                             QSizePolicy, QMessageBox, QScrollArea, QProgressBar, QApplication, QLineEdit, QTabWidget, QCheckBox)
+
+
 
 class AlphaWorker(QThread):
     """
@@ -29,20 +38,78 @@ class AlphaWorker(QThread):
     error = pyqtSignal(str)
     log = pyqtSignal(str)
     
-    def __init__(self, data_path, expression, config, periods):
-        super().__init__()
-        self.data_path = data_path
-        self.expression = expression
-        self.config = config
-        self.periods = periods
+    def __init__(
+        self, 
+        data_path: str, 
+        expression: str, 
+        config: dict, 
+        periods: list
+    ) -> None:
+        """
+        Initialize worker with alpha pipeline parameters.
         
-    def run(self):
+        Args:
+            data_path: Path to data file (CSV or Parquet)
+            expression: Alpha factor expression
+            config: Configuration dictionary
+            periods: List of holding periods to analyze
+        """
+        super().__init__()
+        self.data_path: str = data_path
+        self.expression: str = expression
+        self.config: dict = config
+        self.periods: list = periods
+        
+    def run(self) -> None:
+        """Execute alpha pipeline in background thread."""
         try:
             self.log.emit(f"Loading data from {os.path.basename(self.data_path)}...")
             if self.data_path.endswith('.parquet'):
                 df = pd.read_parquet(self.data_path)
             else:
                 df = pd.read_csv(self.data_path)
+            
+            # --- Column Normalization (Case-Insensitive) ---
+            # Lowercase all columns to ensure consistency with UI display
+            df.columns = [str(c).lower() for c in df.columns]
+
+            # Map common names to standard lowercase
+            col_map = {
+                'last': 'close', 'price': 'close',
+                'vol': 'volume',
+                'date': 'datetime', 'time': 'datetime' 
+            }
+            df.rename(columns=col_map, inplace=True)
+            
+            # Duplicate suffixed OHLCV names only when there is a single candidate.
+            # Multi-asset aligned files must use the explicit Target Return column.
+            close_candidates = [c for c in df.columns if c.endswith(('_close', '.close', ' close'))]
+            open_candidates = [c for c in df.columns if c.endswith(('_open', '.open', ' open'))]
+            high_candidates = [c for c in df.columns if c.endswith(('_high', '.high', ' high'))]
+            low_candidates = [c for c in df.columns if c.endswith(('_low', '.low', ' low'))]
+            volume_candidates = [c for c in df.columns if c.endswith(('_volume', '.volume', ' volume', '_vol', '.vol'))]
+            for c in list(df.columns):
+                if 'close' not in df.columns and len(close_candidates) == 1 and c == close_candidates[0]:
+                    df['close'] = df[c]
+                elif 'open' not in df.columns and len(open_candidates) == 1 and c == open_candidates[0]:
+                    df['open'] = df[c]
+                elif 'high' not in df.columns and len(high_candidates) == 1 and c == high_candidates[0]:
+                    df['high'] = df[c]
+                elif 'low' not in df.columns and len(low_candidates) == 1 and c == low_candidates[0]:
+                    df['low'] = df[c]
+                elif 'volume' not in df.columns and len(volume_candidates) == 1 and c == volume_candidates[0]:
+                    df['volume'] = df[c]
+
+            # --- Auto-Drop Zero Volume Rows ---
+            if self.config.get('auto_drop_zero_vol', False):
+                if 'volume' in df.columns:
+                    initial_rows = len(df)
+                    df = df[df['volume'] > 0].copy()
+                    dropped = initial_rows - len(df)
+                    if dropped > 0:
+                        self.log.emit(f"Auto-Drop: Removed {dropped} rows with Volume=0.")
+                else:
+                    self.log.emit("Auto-Drop: 'volume' column not found, skipping filter.")
             
             # CRITICAL FIX: Ensure 'datetime' is available as a column for the engine
             if 'datetime' not in df.columns:
@@ -76,11 +143,33 @@ class AlphaWorker(QThread):
             
             self.log.emit(f"Data ready: {len(df)} rows. Columns: {list(df.columns)}")
             
-            engine = AlphaEngine()
+            self.engine = AlphaEngine()
             
             self.log.emit(f"Executing pipeline (Periods: {self.periods})...")
-            result = engine.process_pipeline(df, self.expression, self.config, periods=self.periods)
-            
+            if self.config.get('risk_factors'):
+                try:
+                    result = self.engine.process_pipeline(
+                        df, 
+                        self.expression, 
+                        self.config,
+                        periods=self.periods
+                    )
+                except KeyError as e:
+                    # Catch Case-Sensitivity Discrepancy
+                    # "Close" vs "close" mismatch
+                    missing_key = str(e).strip("'")
+                    raise ValueError(
+                        f"列名未对齐，请确保使用小写 / Column name mismatch, use lowercase: {missing_key}\n"
+                        f"Tip: System normalizes standard columns to lowercase (open, high, low, close, volume)."
+                    ) from e
+            else:
+                 # Skip neutralization if no risk factors
+                 result = self.engine.process_pipeline(
+                        df, 
+                        self.expression, 
+                        self.config,
+                        periods=self.periods
+                    )    
             self.log.emit("Pipeline evaluation complete.")
             self.finished.emit(result)
             
@@ -134,8 +223,34 @@ class AlphaTab(QWidget):
         
         self.data_combo = QComboBox()
         self.refresh_data_files()
-        self.data_combo.currentTextChanged.connect(self._on_data_selected)
-        data_layout.addRow("File:", self.data_combo)
+        self.data_combo.currentIndexChanged.connect(self._on_data_selected)
+        
+        # Horizontal layout for File Select + Refresh
+        file_h_layout = QHBoxLayout()
+        file_h_layout.addWidget(self.data_combo)
+        
+        self.refresh_btn = QPushButton("🔄 刷新列表")
+        self.refresh_btn.setToolTip("Reload file list from disk")
+        self.refresh_btn.clicked.connect(self.refresh_data_files)
+        # self.refresh_btn.setFixedWidth(80) 
+        file_h_layout.addWidget(self.refresh_btn)
+        
+        data_layout.addRow("File:", file_h_layout)
+        
+        # New: Info Label for Data Audit
+        self.info_label = QLabel("Ready")
+        self.info_label.setStyleSheet("color: gray; font-size: 10px;")
+        self.info_label.setWordWrap(True)
+        data_layout.addRow("", self.info_label)
+
+        self.target_return_combo = QComboBox()
+        self.target_return_combo.setToolTip("Price column used to calculate forward returns and export backtest close.")
+        data_layout.addRow("Target Return:", self.target_return_combo)
+
+        self.only_overlap_chk = QCheckBox("Only evaluate overlap rows")
+        self.only_overlap_chk.setToolTip("When is_overlap exists, evaluate alpha only on rows where all aligned markets overlap.")
+        self.only_overlap_chk.setChecked(False)
+        data_layout.addRow("", self.only_overlap_chk)
         
         data_group.setLayout(data_layout)
         top_layout.addWidget(data_group)
@@ -181,6 +296,12 @@ class AlphaTab(QWidget):
         self.quantile_ub.setValue(0.99)
         self.quantile_ub.setSingleStep(0.01)
         prep_layout.addRow("Quantile UB:", self.quantile_ub)
+        
+        # New: Auto-Drop Checkbox
+        self.auto_drop_chk = QCheckBox("Auto-drop Zero Volume Rows")
+        self.auto_drop_chk.setToolTip("Automatically remove rows where Volume is 0 (e.g. holidays or non-trading days)")
+        self.auto_drop_chk.setChecked(False) # Default off, logic will set it
+        prep_layout.addRow("", self.auto_drop_chk)
         
         prep_group.setLayout(prep_layout)
         bottom_layout.addWidget(prep_group)
@@ -261,119 +382,240 @@ class AlphaTab(QWidget):
         
         left_splitter.addWidget(bottom_widget)
         scroll_area.setWidget(left_container)
-        main_layout.addWidget(scroll_area)
+        scroll_area.setMinimumWidth(450) # Force a minimum width to prevent UI clipping
         
-        # === Right Panel: Ultimate Dashboard ===
-        self.charts_tabs = QTabWidget()
+        # === Right Panel: Charts Widget (Phase 5B.3: Extracted) ===
+        self.charts = AlphaCharts()
         
-        # --- Tab 1: Overview (Metrics + IC Series) ---
-        tab1_widget = QWidget()
-        tab1_layout = QVBoxLayout(tab1_widget)
+        # === Metrics KPI Panel (BUG-1 fix: was dead code, now wired up) ===
+        self._setup_metrics_panel()
         
-        # Metrics Section inside Tab 1
-        metrics_header = QHBoxLayout()
-        metrics_header.addWidget(QLabel("Metrics for Period:"))
-        self.period_combo = QComboBox()
-        self.period_combo.currentIndexChanged.connect(self._update_metrics_table_view)
-        metrics_header.addWidget(self.period_combo)
-        metrics_header.addStretch()
-        tab1_layout.addLayout(metrics_header)
+        # === Main Layout: Split view (Left Controls + Right Charts) ===
+        main_splitter = QSplitter(Qt.Orientation.Horizontal)
+        main_splitter.addWidget(scroll_area)  # Left panel
+        main_splitter.addWidget(self.charts)  # Right panel (extracted widget)
+        main_splitter.setStretchFactor(0, 2)  # Left panel smaller
+        main_splitter.setStretchFactor(1, 3)  # Right panel larger (charts)
         
-        self.metrics_table = QTableWidget()
-        self.metrics_table.setColumnCount(4)
-        self.metrics_table.setHorizontalHeaderLabels(["Metric", "Value", "Description", "Rating"])
-        self.metrics_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        self.metrics_table.setMinimumHeight(180)
-        tab1_layout.addWidget(self.metrics_table)
-        
-        # IC Series Chart
-        self.ic_figure = plt.figure()
-        self.ic_canvas = FigureCanvas(self.ic_figure)
-        self.ic_canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        tab1_layout.addWidget(self.ic_canvas)
-        
-        self.charts_tabs.addTab(tab1_widget, "Overview")
-        
-        # --- Tab 2: Decay Analysis ---
-        tab2_widget = QWidget()
-        tab2_layout = QVBoxLayout(tab2_widget)
-        self.decay_figure = plt.figure()
-        self.decay_canvas = FigureCanvas(self.decay_figure)
-        tab2_layout.addWidget(self.decay_canvas)
-        self.charts_tabs.addTab(tab2_widget, "Decay Analysis")
-        
-        # --- Tab 3: Quantile Analysis (Splitter: Bar | Cum Line) ---
-        tab3_widget = QWidget()
-        tab3_layout = QVBoxLayout(tab3_widget)
-        tab3_splitter = QSplitter(Qt.Orientation.Horizontal)
-        
-        # Left: Bar Chart
-        self.q_figure = plt.figure()
-        self.q_canvas = FigureCanvas(self.q_figure)
-        tab3_splitter.addWidget(self.q_canvas)
-        
-        # Right: Cumulative Chart
-        self.q_cum_figure = plt.figure()
-        self.q_cum_canvas = FigureCanvas(self.q_cum_figure)
-        tab3_splitter.addWidget(self.q_cum_canvas)
-        
-        tab3_layout.addWidget(tab3_splitter)
-        self.charts_tabs.addTab(tab3_widget, "Quantile Analysis")
-        
-        # --- Tab 4: Risk Diagnosis (Heatmap) ---
-        tab4_widget = QWidget()
-        tab4_layout = QVBoxLayout(tab4_widget)
-        self.risk_figure = plt.figure()
-        self.risk_canvas = FigureCanvas(self.risk_figure)
-        tab4_layout.addWidget(self.risk_canvas)
-        self.charts_tabs.addTab(tab4_widget, "Risk Diagnosis")
-        
-        main_layout.addWidget(self.charts_tabs)
+        main_layout = QHBoxLayout()
+        main_layout.addWidget(main_splitter)
         self.setLayout(main_layout)
         
-        # Initial populate
-        self._on_data_selected(self.data_combo.currentText())
+        # Initial populate manually
+        self._on_data_selected(0)
 
     def refresh_data_files(self):
-        """Scan data/processed/ for parquet files."""
-        folder = Path("data/processed")
-        if not folder.exists():
-            folder.mkdir(parents=True, exist_ok=True)
-            
-        files = list(folder.glob("*.parquet"))
+        """Scan data/processed/ AND Master DB for parquet files."""
         self.data_combo.clear()
-        if files:
-            self.data_combo.addItems([f.name for f in files])
-        else:
+        
+        # 1. Processed Data (Aligned)
+        processed_dir = Path("data/processed")
+        if processed_dir.exists():
+            files = list(processed_dir.glob("*.parquet"))
+            for f in files:
+                self.data_combo.addItem(f"[Processed] {f.name}", str(f.absolute()))
+                
+        # 2. Master DB Data (Raw)
+        try:
+            # Use CacheManager to get info (optimized recursive)
+            master_files, _, _ = CacheManager.get_master_db_info()
+            for info in master_files:
+                display_name = f"[Master] {info['code']} ({info['timeframe']})"
+                # Store absolute path
+                self.data_combo.addItem(display_name, info['filepath'])
+        except Exception as e:
+            print(f"Error loading Master DB files: {e}")
+            
+        if self.data_combo.count() == 0:
             self.data_combo.addItem("No data found")
-            self.run_button.setEnabled(False)
+            if hasattr(self, 'run_button'):
+                self.run_button.setEnabled(False)
 
-    def _on_data_selected(self, filename):
-        """Load columns to populate risk factors."""
-        if not filename or filename == "No data found":
+    @staticmethod
+    def _infer_timeframe_from_text(text: str) -> str:
+        text = str(text).lower()
+        if any(token in text for token in ['1d', 'daily', '(d)', '(day)']):
+            return 'daily'
+        if any(token in text for token in ['1m', '3m', '5m', '15m', '30m', '60m', 'minute', 'min']):
+            return 'intraday'
+        return 'unknown'
+
+    @staticmethod
+    def _is_price_candidate(col: str) -> bool:
+        col = str(col).lower()
+        return col in {'close', 'last', 'price'} or col.endswith(('_close', '.close', ' close'))
+
+    def _checked_risk_factors(self):
+        factors = []
+        for i in range(self.risk_list.count()):
+            item = self.risk_list.item(i)
+            if item.checkState() == Qt.CheckState.Checked:
+                factors.append(item.data(Qt.ItemDataRole.UserRole) or item.text())
+        return factors
+
+    def _on_data_selected(self, index):
+        """Load columns and audit data."""
+        filepath = self.data_combo.currentData() # Get from UserRole
+        
+        if not filepath or filepath == "No data found":
+            self.run_button.setEnabled(False)
+            self.info_label.setText("")
+            self.target_return_combo.clear()
+            self.only_overlap_chk.setChecked(False)
+            self.only_overlap_chk.setEnabled(False)
             return
             
-        path = Path("data/processed") / filename
+        path = Path(filepath)
         if not path.exists():
+            self.info_label.setText(f"File not found: {path.name}")
             return
 
         try:
-            # Read minimal rows to get columns
-            df = pd.read_parquet(path)
-            columns = [c for c in df.columns if c not in ['datetime', 'symbol', 'date', 'time', 'factor', 'next_ret']]
+            # 1. Column Loading (Full Read for columns only? Or use pyarrow schema)
+            import pyarrow.parquet as pq
+            
+            # Read schema for columns
+            parquet_file = pq.ParquetFile(path)
+            schema_names = parquet_file.schema.names
+            num_rows = parquet_file.metadata.num_rows
+            
+            # Filter non-feature columns and normalize to lowercase for display
+            # BUG-4 fix: also exclude non-numeric, _symbol suffix, and near-constant columns
+            exclude = ['datetime', 'symbol', 'date', 'time', 'factor', 'next_ret', 'index']
+            
+            # Build a type-aware column list using pyarrow schema
+            import pyarrow as pa
+            schema = parquet_file.schema_arrow
+            
+            valid_columns = []
+            for field in schema:
+                col_lower = field.name.lower()
+                # Skip system/reserved columns
+                if col_lower in exclude:
+                    continue
+                # Skip _symbol suffix identifier columns (e.g., zl1!_symbol, myx-fcpo1!_symbol)
+                if col_lower.endswith('_symbol'):
+                    continue
+                # Skip non-numeric types (strings, booleans, binary)
+                if not pa.types.is_integer(field.type) and not pa.types.is_floating(field.type):
+                    continue
+                valid_columns.append(col_lower)
+            
+            valid_columns = sorted(list(set(valid_columns)))
+
+            price_candidates = [c for c in valid_columns if self._is_price_candidate(c)]
+            self.target_return_combo.clear()
+            if price_candidates:
+                ordered_prices = sorted(
+                    price_candidates,
+                    key=lambda c: (c not in {'close', 'last', 'price'}, c)
+                )
+                for col in ordered_prices:
+                    self.target_return_combo.addItem(col, col)
+                self.target_return_combo.setEnabled(True)
+            else:
+                self.target_return_combo.addItem("No price column found", "")
+                self.target_return_combo.setEnabled(False)
+            
+            # Detect near-constant columns (variance ≈ 0) by reading a small sample
+            near_constant_cols = set()
+            if valid_columns:
+                try:
+                    sample_df = pd.read_parquet(path, columns=[
+                        c for c in schema_names if c.lower() in valid_columns
+                    ])
+                    for col in sample_df.columns:
+                        col_std = sample_df[col].std()
+                        if col_std is not None and (pd.isna(col_std) or col_std < 1e-10):
+                            near_constant_cols.add(col.lower())
+                except Exception:
+                    pass  # If sample read fails, skip constant detection
             
             self.risk_list.clear()
-            for col in columns:
-                item = QListWidgetItem(col)
-                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-                item.setCheckState(Qt.CheckState.Unchecked)
+            for col in valid_columns:
+                if col in near_constant_cols:
+                    item = QListWidgetItem(f"⚠️ {col} (常量)")
+                    item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                    item.setCheckState(Qt.CheckState.Unchecked)
+                    item.setToolTip("Near-constant column — neutralization has no effect")
+                    item.setForeground(QColor("#888"))
+                    item.setData(Qt.ItemDataRole.UserRole, col)
+                else:
+                    item = QListWidgetItem(col)
+                    item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                    item.setCheckState(Qt.CheckState.Unchecked)
+                    item.setData(Qt.ItemDataRole.UserRole, col)
                 self.risk_list.addItem(item)
                 
             self.run_button.setEnabled(True)
-            self._log(f"Loaded columns from {filename}")
+            self._log(f"Loaded {len(valid_columns)} numeric columns from {path.name} (excluded {len(schema_names) - len(valid_columns) - len(exclude)} non-numeric/system columns)")
+            
+            # 2. Data Audit (Optimized) & Mode Detection
+            is_master = "[Master]" in self.data_combo.currentText()
+            is_processed = "[Processed]" in self.data_combo.currentText()
+            
+            mode_text = ""
+            mode_color = "gray"
+            
+            if is_master:
+                mode_text = "🔒 Mode: Single Asset"
+                mode_color = "#4CAF50" # Green
+                self.auto_drop_chk.setChecked(self._infer_timeframe_from_text(self.data_combo.currentText()) == 'daily')
+            elif is_processed:
+                mode_text = "🔗 Mode: Aligned / Multi-Asset"
+                mode_color = "#2196F3" # Blue
+                self.auto_drop_chk.setChecked(False) # Default OFF for Aligned (presumably clean)
+
+            has_overlap = any(c.lower() == 'is_overlap' for c in schema_names)
+            self.only_overlap_chk.setEnabled(has_overlap)
+            self.only_overlap_chk.setChecked(bool(has_overlap and is_processed))
+                
+            # Audit Volume (Partial Read)
+            # Only read 'Volume' column if it exists to check for 0s
+            vol_msg = ""
+            try:
+                # Check if volume column exists (case-insensitive)
+                vol_col = next((c for c in schema_names if c.lower() == 'volume'), None)
+                if vol_col:
+                    # Read only volume column
+                    df_vol = pd.read_parquet(path, columns=[vol_col])
+                    zero_vol_count = (df_vol[vol_col] == 0).sum()
+                    
+                    if zero_vol_count > 0:
+                        vol_msg = f"<br><span style='color:orange'>⚠️ Contains {zero_vol_count} rows with Volume=0. Auto-drop recommended.</span>"
+                    else:
+                        vol_msg = "<br><span style='color:green'>✔ Volume check passed.</span>"
+            except Exception as e:
+                vol_msg = f"<br>Volume check error: {str(e)}"
+
+            # Get Date Range (from metadata statistics if available, or reading columns)
+            # Pyarrow metadata stats might have min/max for columns
+            # Try to read 'Date' or index column
+            date_range_str = ""
+            try:
+                # Try to find date col
+                date_col = next((c for c in schema_names if c.lower() in ['date', 'datetime', 'time']), None)
+                if date_col:
+                     # Reading full date column is fast enough? 
+                     # Let's try to read min/max from statistics if available (often not written)
+                     # Fallback to reading column
+                     df_date = pd.read_parquet(path, columns=[date_col])
+                     min_date = df_date[date_col].min()
+                     max_date = df_date[date_col].max()
+                     date_range_str = f"{pd.to_datetime(min_date).date()} ~ {pd.to_datetime(max_date).date()}"
+            except:
+                pass
+                
+            self.info_label.setText(
+                f"<b>{mode_text}</b><br>"
+                f"Rows: {num_rows} | Date: {date_range_str}"
+                f"{vol_msg}"
+            )
+            self.info_label.setStyleSheet(f"border-left: 3px solid {mode_color}; padding-left: 5px; color: #ccc;")
             
         except Exception as e:
-            self._log(f"Error reading {filename}: {e}")
+            self._log(f"Error reading {path.name}: {e}")
+            self.info_label.setText(f"Error: {str(e)}")
 
     def _log(self, message):
         self.log_view.appendPlainText(f"[{pd.Timestamp.now().strftime('%H:%M:%S')}] {message}")
@@ -399,42 +641,54 @@ class AlphaTab(QWidget):
         if not expression:
             QMessageBox.warning(self, "Input Error", "Please enter a factor expression.")
             return
-        if "df['factor']" not in expression:
+        if "df['factor']" not in expression and 'df["factor"]' not in expression:
              QMessageBox.warning(self, "Input Error", "Expression must assign to df['factor'].\nExample: df['factor'] = ...")
              return
              
-        data_file = self.data_combo.currentText()
-        if not data_file:
+        data_file_path = self.data_combo.currentData()
+        if not data_file_path:
             return
-        data_path = str(Path("data/processed") / data_file)
+        data_path = str(data_file_path)
         
         # Parse Periods
         periods_str = self.periods_input.text()
         try:
-            periods = [int(p.strip()) for p in periods_str.split(',') if p.strip()]
-            if not periods: raise ValueError
+            periods = sorted({int(p.strip()) for p in periods_str.split(',') if p.strip()})
+            if not periods or any(p <= 0 for p in periods):
+                raise ValueError
         except:
-             QMessageBox.warning(self, "Input Error", "Invalid Periods format. Use comma separated integers (e.g. 1, 5).")
+             QMessageBox.warning(self, "Input Error", "Periods must be positive integers (e.g. 1, 5, 10).")
              return
+
+        q_lb = self.quantile_lb.value()
+        q_ub = self.quantile_ub.value()
+        if not (0 <= q_lb < q_ub <= 1):
+            QMessageBox.warning(self, "Input Error", "Quantile bounds must satisfy 0 <= LB < UB <= 1.")
+            return
+
+        target_return_col = self.target_return_combo.currentData()
+        if not target_return_col:
+            QMessageBox.warning(self, "Input Error", "Please select a Target Return price column.")
+            return
         
         # 2. Config Construction
-        risk_factors = []
-        for i in range(self.risk_list.count()):
-            item = self.risk_list.item(i)
-            if item.checkState() == Qt.CheckState.Checked:
-                risk_factors.append(item.text())
+        risk_factors = self._checked_risk_factors()
         
         config = {
             'winsor_method': self.method_combo.currentText(),
-            'quantile_lb': self.quantile_lb.value(),
-            'quantile_ub': self.quantile_ub.value(),
+            'quantile_lb': q_lb,
+            'quantile_ub': q_ub,
             'risk_factors': risk_factors,
-            'ridge_alpha': self.ridge_alpha.value()
+            'ridge_alpha': self.ridge_alpha.value(),
+            'auto_drop_zero_vol': self.auto_drop_chk.isChecked(), # Pass config
+            'target_return_col': target_return_col,
+            'only_overlap': self.only_overlap_chk.isChecked()
         }
         
         # 3. Execution
         self.log_view.clear()
         self._log(f"Starting pipeline with periods {periods}...")
+        self._log(f"Target return column: {target_return_col}")
         self._set_loading_state(True)
         self.export_button.setEnabled(False)
         self.save_signal_button.setEnabled(False)
@@ -452,33 +706,88 @@ class AlphaTab(QWidget):
         QMessageBox.critical(self, "Execution Error", message)
 
     def _on_worker_finished(self, result):
-        self._set_loading_state(False)
-        self._log("Processing complete. Updating UI...")
+        """Handle worker completion."""
+        # Robust Cleanup: Wait for the thread to fully exit its C++ loop before destroying
+        if hasattr(self, 'current_worker') and self.current_worker:
+            self.current_worker.wait()
+            self.current_worker.deleteLater()
+            self.current_worker = None
+            
+        self._log("Processing complete. Rendering charts (This may take a moment)...")
         self.current_result = result
-        self.export_button.setEnabled(True)
-        self.save_signal_button.setEnabled(True)
-        
-        # 1. Update Period Combo
+        self._log(f"Target return column used: {result.get('target_return_col', 'N/A')}")
+
         ic_decay = result.get('ic_decay_table', pd.DataFrame())
         self.period_combo.blockSignals(True)
         self.period_combo.clear()
         if not ic_decay.empty:
-            periods = sorted(ic_decay.index.tolist())
-            self.period_combo.addItems([str(p) for p in periods])
-            self.period_combo.setCurrentIndex(0) # Default to shortest period
+            for p in sorted(ic_decay.index.tolist()):
+                self.period_combo.addItem(str(p))
+            self.period_combo.setCurrentIndex(0)
         self.period_combo.blockSignals(False)
         
-        # 2. Update Metrics & Charts
-        self._update_metrics_table_view()
+        # Pump events to refresh the UI text
+        QApplication.processEvents()
+        
+        # Update charts using the new widget
         self._update_charts(result)
+        
+        # Update KPI Metrics Table (BUG-1 fix: was dead code, now wired up)
+        self._update_metrics_table_view()
+        
+        # Turn off loading state (single call — BUG-8 fix)
+        self._set_loading_state(False)
+        self.export_button.setEnabled(True)
+        self.save_signal_button.setEnabled(True)
         
         QMessageBox.information(self, "Success", "Alpha pipeline executed successfully!")
 
+    def _setup_metrics_panel(self):
+        """Create the Metrics KPI table and period selector inside the Charts widget. (BUG-1 fix)"""
+        from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QTableWidget, QTableWidgetItem, QHeaderView
+        
+        metrics_tab = QWidget()
+        metrics_layout = QVBoxLayout(metrics_tab)
+        metrics_layout.setContentsMargins(5, 5, 5, 5)
+        
+        # Period selector
+        selector_layout = QHBoxLayout()
+        selector_layout.addWidget(QLabel("Period:"))
+        self.period_combo = QComboBox()
+        self.period_combo.setMinimumWidth(80)
+        self.period_combo.currentIndexChanged.connect(lambda: self._update_metrics_table_view())
+        selector_layout.addWidget(self.period_combo)
+        selector_layout.addStretch()
+        metrics_layout.addLayout(selector_layout)
+        
+        # KPI Table
+        self.metrics_table = QTableWidget()
+        self.metrics_table.setColumnCount(4)
+        self.metrics_table.setHorizontalHeaderLabels(["Metric", "Value", "Description", "Rating"])
+        self.metrics_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.metrics_table.verticalHeader().setVisible(False)
+        self.metrics_table.setAlternatingRowColors(True)
+        self.metrics_table.setStyleSheet(
+            "QTableWidget { gridline-color: #444; }"
+            "QTableWidget::item { padding: 4px; }"
+        )
+        metrics_layout.addWidget(self.metrics_table)
+        
+        # Insert as first tab in charts widget for maximum visibility
+        self.charts.insertTab(0, metrics_tab, "📊 Metrics KPI")
+        self.charts.setCurrentIndex(0)
+
     def _update_metrics_table_view(self):
+        """Populate Metrics KPI table from the current result. (BUG-1 fix: was dead code)"""
         if not self.current_result: return
         
         ic_decay = self.current_result.get('ic_decay_table', pd.DataFrame())
-        metrics_v1 = self.current_result.get('metrics', {}) # Primary stats
+        metrics_v1 = self.current_result.get('metrics', {})
+        
+        # Populate period combo if empty
+        if self.period_combo.count() == 0 and not ic_decay.empty:
+            for p in ic_decay.index:
+                self.period_combo.addItem(str(p))
         
         current_p_text = self.period_combo.currentText()
         if not current_p_text and not ic_decay.empty:
@@ -504,7 +813,6 @@ class AlphaTab(QWidget):
             except Exception as e:
                 self._log(f"Error parse metrics: {e}")
         else:
-            # Fallback to dictionary
             for k, v in metrics_v1.items():
                 rows.append((k, v))
                 
@@ -514,11 +822,14 @@ class AlphaTab(QWidget):
             self.metrics_table.setItem(i, 0, QTableWidgetItem(k))
             
             # Value Formatting
-            value_str = f"{v:.4f}"
-            if k == 'Win Rate': value_str = f"{v*100:.1f}%"
-            elif k == 'T-Stat': value_str = f"{v:.2f}"
-            elif k == 'Sample N': value_str = f"{int(v)}"
-            elif k == 'P-Value': value_str = f"{v:.4e}" if v < 0.001 else f"{v:.4f}"
+            if pd.isna(v):
+                value_str = "N/A"
+            else:
+                if k == 'Win Rate': value_str = f"{v*100:.1f}%"
+                elif k == 'T-Stat': value_str = f"{v:.2f}"
+                elif k == 'Sample N': value_str = f"{int(v)}"
+                elif k == 'P-Value': value_str = f"{v:.4e}" if v < 0.001 else f"{v:.4f}"
+                else: value_str = f"{v:.4f}"
             
             self.metrics_table.setItem(i, 1, QTableWidgetItem(value_str))
             
@@ -536,11 +847,11 @@ class AlphaTab(QWidget):
                 else:
                     description = "Weak Signal"
             elif k == 'ICIR':
-                if v > 1.0: 
+                if abs(v) > 1.0: 
                     description = "Very Stable"
                     rating = "Excellent"
                     bg_color = QColor(50, 100, 50)
-                elif v > 0.5:
+                elif abs(v) > 0.5:
                     description = "Stable"
             elif k == 'P-Value':
                 if v < 0.05:
@@ -550,6 +861,16 @@ class AlphaTab(QWidget):
                 else:
                     description = "Not Significant"
                     text_color = QColor("gray")
+            elif k == 'Win Rate':
+                if v > 0.55:
+                    description = "Consistent"
+                    rating = "Good"
+                    bg_color = QColor(50, 100, 50)
+                elif v > 0.45:
+                    description = "Average"
+                else:
+                    description = "Unstable"
+                    text_color = QColor("#FF9800")
             
             self.metrics_table.setItem(i, 2, QTableWidgetItem(description))
             
@@ -562,175 +883,120 @@ class AlphaTab(QWidget):
             self.metrics_table.setItem(i, 3, rating_item)
 
     def _update_charts(self, result):
-        # 1. Update IC Chart (Tab 1: Overview)
-        ic_series = result.get('ic_series', pd.DataFrame())
-        self.ic_figure.clear()
-        if not ic_series.empty:
-            ax = self.ic_figure.add_subplot(111)
-            try:
-                if not isinstance(ic_series.index, pd.DatetimeIndex):
-                    dates = pd.to_datetime(ic_series.index)
-                else:
-                    dates = ic_series.index
-                ax.plot(dates, ic_series['Rank_IC'], label='Rank IC (Primary)', color='#00BFFF', linewidth=1)
-                mean_ic = ic_series['Rank_IC'].mean()
-                ax.axhline(mean_ic, color='#FF4500', linestyle='--', label=f"Mean: {mean_ic:.4f}")
-                ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
-                ax.xaxis.set_major_locator(mdates.AutoDateLocator())
-                self.ic_figure.autofmt_xdate()
-            except:
-                ax.plot(ic_series['Rank_IC'].values, label='Rank IC', color='blue')
-            ax.legend()
-            ax.set_title("Rank IC Time Series (Primary Period)")
-            ax.grid(True, alpha=0.2)
-            self.ic_canvas.draw()
-            
-        # 2. Update IC Decay Chart (Tab 2: Decay)
-        ic_decay = result.get('ic_decay_table', pd.DataFrame())
-        self.decay_figure.clear()
-        if not ic_decay.empty:
-            ax = self.decay_figure.add_subplot(111)
-            ax.plot(ic_decay.index, ic_decay['Rank IC'], marker='o', label='Rank IC Mean', color='#00FF00')
-            ax.set_title("IC Decay: Signal Strength vs Holding Period")
-            ax.set_xlabel("Holding Period (Days)")
-            ax.set_ylabel("Rank IC Mean")
-            ax.set_xticks(ic_decay.index)
-            ax.grid(True, alpha=0.3)
-            # Add labels
-            for x, y in zip(ic_decay.index, ic_decay['Rank IC']):
-                ax.annotate(f"{y:.3f}", (x, y), textcoords="offset points", xytext=(0,10), ha='center', color='white')
-            self.decay_canvas.draw()
-            
-        # 3. Update Quantile Charts (Tab 3: Quantile)
-        # Left: Bar Chart
-        q_ret = result.get('quantile_returns', pd.Series())
-        self.q_figure.clear()
-        if not q_ret.empty:
-            ax = self.q_figure.add_subplot(111)
-            colors = ['#FF4500' if i==0 else '#32CD32' if i==4 else '#808080' for i in range(len(q_ret))]
-            q_ret.plot(kind='bar', ax=ax, color=colors, alpha=0.8)
-            ax.set_title("Quantile Mean Return")
-            ax.set_xlabel("Group (1=Short, 5=Long)")
-            ax.set_ylabel("Mean Forward Return")
-            ax.grid(axis='y', alpha=0.2)
-            self.q_canvas.draw()
-
-        # Right: Cumulative Lines (New)
-        q_cum = result.get('quantile_cum_ret', pd.DataFrame())
-        self.q_cum_figure.clear()
-        if not q_cum.empty:
-            ax = self.q_cum_figure.add_subplot(111)
-            # Q1=Red, Q5=Green, Q2-4=Grey
-            palette = {1: '#FF4500', 5: '#32CD32', 2: 'grey', 3: 'grey', 4: 'grey'}
-            
-            for col in q_cum.columns:
-                 # Ensure col is int if possible for color mapping
-                 try:
-                     c_int = int(col)
-                     color = palette.get(c_int, 'grey')
-                     alpha = 1.0 if c_int in [1, 5] else 0.5
-                     width = 2.0 if c_int in [1, 5] else 1.0
-                 except:
-                     color = 'grey'
-                     alpha = 0.5
-                     width = 1.0
-                 
-                 ax.plot(q_cum.index, q_cum[col], label=f"Q{col}", color=color, alpha=alpha, linewidth=width)
-            
-            ax.set_title("Cumulative Quantile Returns")
-            ax.legend()
-            ax.grid(True, alpha=0.2)
-            self.q_cum_canvas.draw()
-
-        # 4. Update Risk Heatmap (Tab 4: Risk)
-        # We need the full correlation matrix now
-        risk_corr = result.get('risk_correlation_matrix', pd.DataFrame())
-        self.risk_figure.clear()
-        if not risk_corr.empty:
-             ax = self.risk_figure.add_subplot(111)
-             im = ax.imshow(risk_corr, cmap='coolwarm', vmin=-1, vmax=1)
-             self.risk_figure.colorbar(im, ax=ax)
-             
-             # Labels
-             ax.set_xticks(np.arange(len(risk_corr.columns)))
-             ax.set_yticks(np.arange(len(risk_corr.index)))
-             ax.set_xticklabels(risk_corr.columns, rotation=45, ha="right")
-             ax.set_yticklabels(risk_corr.index)
-             
-             # Text annotations
-             for i in range(len(risk_corr.index)):
-                 for j in range(len(risk_corr.columns)):
-                     text = ax.text(j, i, f"{risk_corr.iloc[i, j]:.2f}",
-                                    ha="center", va="center", color="w", fontsize=9)
-             
-             ax.set_title("Risk Factor Correlation Matrix (Spearman)")
-             self.risk_figure.tight_layout()
-             self.risk_canvas.draw()
-        else:
-             # Fallback to bar chart if matrix missing but exposure_df exists (Legacy compat)
-             risk_df = result.get('risk_exposure_df', pd.DataFrame())
-             if not risk_df.empty:
-                 ax = self.risk_figure.add_subplot(111)
-                 risk_df.plot(kind='barh', ax=ax, color=['#FF6347', '#32CD32'], alpha=0.8)
-                 ax.set_title("Risk Exposure: Pre vs Post (Legacy View)")
-                 self.risk_canvas.draw()
-             else:
-                 ax = self.risk_figure.add_subplot(111)
-                 ax.text(0.5, 0.5, "No Risk Analysis Data", ha='center', va='center')
-                 ax.axis('off')
-                 self.risk_canvas.draw()
+        """
+        Update charts with analysis results (Phase 5B.3: Using extracted widget).
+        
+        Args:
+            result: Dictionary containing analysis results from AlphaEngine
+        """
+        # Update charts using the new widget (Convenience method)
+        self.charts.update_all_charts(result)
+        
+        self.log_view.appendPlainText("[INFO] Charts updated successfully.")
 
     def _save_signal_to_db(self):
-        """Save factor signal to data/signals/ for backtesting center."""
+        """Save factor signal and DRAFT JSON config (Baton Relay Package)"""
         if not self.current_result: 
              QMessageBox.warning(self, "Error", "No results to save. Please run the pipeline first.")
              return
         
-        # Use full signal_df if available, else fallback to preview (legacy safety)
-        df = self.current_result.get('signal_df', self.current_result.get('preview_df', pd.DataFrame()))
-        
+        df = self.current_result.get('signal_df', pd.DataFrame())
         if df.empty: 
              QMessageBox.warning(self, "Error", "Result dataframe is empty.")
              return
 
-        # Prompt for filename
-        from PyQt6.QtWidgets import QInputDialog
-        filename, ok = QInputDialog.getText(self, "Save Signal", "Enter signal name (e.g. fcpo_rev_v1):")
+        from ui.export_alpha_dialog import ExportAlphaDialog
+        from PyQt6.QtWidgets import QFileDialog
         
-        if ok and filename:
-            # Basic validation
-            filename = "".join([c for c in filename if c.isalnum() or c in ('_', '-')]).strip()
-            if not filename:
-                QMessageBox.warning(self, "Error", "Invalid filename.")
-                return
-                
-            path = Path("data/signals")
-            path.mkdir(parents=True, exist_ok=True)
-            full_path = path / f"{filename}.parquet"
+        dialog = ExportAlphaDialog(self)
+        if dialog.exec() != dialog.DialogCode.Accepted:
+            return
             
-            try:
-                # Use centralized export logic (Phase 5.2)
-                # This handles normalization, validation, ATR/ADX calculation, and warm-up drop.
-                save_df = AlphaEngine.prepare_signal_export(df, window=14)
+        export_data = dialog.get_export_data()
+        stg_id = export_data["strategy_id"]
+        stg_name = export_data["strategy_name"]
+        save_mode = export_data["save_mode"]
+        
+        # Determine local_dir if needed
+        local_dir_path = None
+        if save_mode in ['local', 'both']:
+            local_dir_path = QFileDialog.getExistingDirectory(
+                self, "Select Local Export Directory", "", QFileDialog.Option.ShowDirsOnly
+            )
+            if not local_dir_path:
+                return
+
+        folder_name = f"{stg_id}_{stg_name}"
+        parquet_filename = f"{stg_id}_data.parquet"
+        json_filename = f"{stg_id}_config.json"
+        
+        try:
+            # 1. 导出 Parquet 信号文件
+            save_df = AlphaEngine.prepare_signal_export(df)
+            if save_df.empty:
+                raise ValueError("Resulting signal is empty after dropping warm-up period.")
+            
+            # 2. 收集环境与流水线上下文
+            universe = "unknown"
+            timeframe = "unknown"
+            data_text = self.data_combo.currentText()
+            if "]" in data_text:
+                universe = data_text.split("]")[1].strip()  # 简单提取
+            
+            expr = self.expression_input.toPlainText().strip()
+            winsor = self.method_combo.currentText()
+            qlb = self.quantile_lb.value()
+            qub = self.quantile_ub.value()
+            risk_factors = self._checked_risk_factors()
+            ridge_alpha = self.ridge_alpha.value()
+            auto_drop = self.auto_drop_chk.isChecked()
+            
+            # 3. 构造接力棒 JSON DRAFT 载体
+            from src.core.models.strategy_config import StrategyConfig, StrategyMetadata, EnvironmentConfig, AlphaPipelineConfig
+            
+            stg_config = StrategyConfig(
+                metadata=StrategyMetadata(strategy_id=stg_id, strategy_name=stg_name),
+                environment_config=EnvironmentConfig(universe=universe, timeframe=timeframe),
+                alpha_pipeline=AlphaPipelineConfig(
+                    expression=expr,
+                    winsor_method=winsor,
+                    quantile_lb=qlb,
+                    quantile_ub=qub,
+                    risk_factors=risk_factors,
+                    ridge_alpha=ridge_alpha,
+                    auto_drop_zero_vol=auto_drop
+                )
+            )
+            
+            paths_created = []
+            
+            # Save to Data Center (which physically goes to DataCenter/Alpha_data)
+            dc_base = None
+            if save_mode in ['data_center', 'both']:
+                dc_base = Path("DataCenter/Alpha_data") / folder_name
+                dc_base.mkdir(parents=True, exist_ok=True)
+                save_df.to_parquet(dc_base / parquet_filename, index=False)
+                stg_config.to_json(str(dc_base / json_filename))
+                paths_created.append(f"Data Center (Alpha):\n- {dc_base / parquet_filename}")
                 
-                # Check if result is empty after dropping warm-up
-                if save_df.empty:
-                    raise ValueError("Resulting signal is empty after dropping warm-up period (30 rows).")
+            # Save to Local
+            if save_mode in ['local', 'both']:
+                local_base = Path(local_dir_path) / folder_name
+                local_base.mkdir(parents=True, exist_ok=True)
+                save_df.to_parquet(local_base / parquet_filename, index=False)
+                stg_config.to_json(str(local_base / json_filename))
+                paths_created.append(f"Local:\n- {local_base / parquet_filename}")
+            
+            msg = "\n\n".join(paths_created)
+            QMessageBox.information(self, "Success", f"Baton Relay Package Saved Successfully!\n\n{msg}")
                 
-                save_df.to_parquet(full_path, index=False)
-                
-                QMessageBox.information(self, "Success", 
-                    f"Signal saved successfully!\n"
-                    f"File: {full_path.name}\n"
-                    f"Rows: {len(save_df)}\n"
-                    f"Cols: {list(save_df.columns)}")
-                    
-            except Exception as e:
-                QMessageBox.critical(self, "Save Error", f"Could not save signal:\n{str(e)}")
+        except Exception as e:
+            import traceback
+            QMessageBox.critical(self, "Save Error", f"Could not package strategy:\n{str(e)}\n\n{traceback.format_exc()}")
 
     def _export_signal(self):
         if not self.current_result: return
-        df = self.current_result.get('preview_df', pd.DataFrame())
+        df = self.current_result.get('signal_df', pd.DataFrame())
         if df.empty: return
         
         # Use existing exported_data/backtest as default dir
@@ -750,19 +1016,8 @@ class AlphaTab(QWidget):
             return
             
         try:
-            # Export basic columns + factor
-            export_df = df.copy()
-            # Standardize close
-            for c in ['close', 'Close', 'CLOSE', 'last', 'Last', 'price', 'Price']:
-                if c in export_df.columns:
-                    export_df.rename(columns={c: 'close'}, inplace=True)
-                    break
-                    
-            export_cols = ['datetime', 'symbol', 'close', 'factor']
-            final_cols = [c for c in export_cols if c in export_df.columns]
-            
-            # Ensure datetime is compatible
-            export_df[final_cols].to_parquet(file_path, index=False)
-            QMessageBox.information(self, "Export Success", f"Signal exported to:\n{file_path}\nFormat: Parquet")
+            export_df = AlphaEngine.prepare_signal_export(df)
+            export_df.to_parquet(file_path, index=False)
+            QMessageBox.information(self, "Export Success", f"Signal exported to:\n{file_path}\nRows: {len(export_df)}\nFormat: Parquet")
         except Exception as e:
              QMessageBox.critical(self, "Export Error", str(e))
