@@ -40,10 +40,11 @@ class AlphaEngine:
             raise ValueError(f"Expression syntax error: {str(e)}")
 
         for node in ast.walk(tree):
+            # 1. Block shift / pct_change negative arguments
             if isinstance(node, ast.Call):
                 func_name = getattr(node.func, 'attr', None)
                 if func_name in {'shift', 'pct_change'}:
-                    # 1. Check positional arguments
+                    # Check positional arguments
                     for arg in node.args:
                         # Negative UnaryOp (e.g. -1)
                         if isinstance(arg, ast.UnaryOp) and isinstance(arg.op, ast.USub):
@@ -55,7 +56,7 @@ class AlphaEngine:
                         elif isinstance(arg, ast.Constant) and isinstance(val := getattr(arg, 'value', None), (int, float)) and val < 0:
                             raise ValueError(f"Look-ahead bias detected: negative argument in {func_name}() is forbidden.")
 
-                    # 2. Check keyword arguments (e.g. periods=-5)
+                    # Check keyword arguments (e.g. periods=-5)
                     for kw in node.keywords:
                         if kw.arg in {'periods', 'periods_y', 'periods_x'}:
                             val_node = kw.value
@@ -66,6 +67,19 @@ class AlphaEngine:
                                     raise ValueError(f"Look-ahead bias detected: negative keyword argument '{kw.arg}' in {func_name}() is forbidden.")
                             elif isinstance(val_node, ast.Constant) and isinstance(val := getattr(val_node, 'value', None), (int, float)) and val < 0:
                                 raise ValueError(f"Look-ahead bias detected: negative keyword argument '{kw.arg}' in {func_name}() is forbidden.")
+
+            # 2. Block iloc / iat / loc / at negative subscripts (e.g. iloc[-1])
+            elif isinstance(node, ast.Subscript):
+                if isinstance(node.value, ast.Attribute) and node.value.attr in {'iloc', 'iat', 'loc', 'at'}:
+                    # Walk the subscript slice to find any negative index
+                    for sub_node in ast.walk(node.slice):
+                        if isinstance(sub_node, ast.UnaryOp) and isinstance(sub_node.op, ast.USub):
+                            if isinstance(sub_node.operand, ast.Constant) and sub_node.operand.value > 0:
+                                raise ValueError(f"Look-ahead bias detected: negative indexing in {node.value.attr} is forbidden.")
+                            elif isinstance(sub_node.operand, ast.Num) and sub_node.operand.n > 0:
+                                raise ValueError(f"Look-ahead bias detected: negative indexing in {node.value.attr} is forbidden.")
+                        elif isinstance(sub_node, ast.Constant) and isinstance(val := getattr(sub_node, 'value', None), (int, float)) and val < 0:
+                            raise ValueError(f"Look-ahead bias detected: negative indexing in {node.value.attr} is forbidden.")
 
     @staticmethod
     def _clean_stat_value(value, default=0.0):

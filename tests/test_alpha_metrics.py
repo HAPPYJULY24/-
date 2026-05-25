@@ -335,20 +335,42 @@ def test_new_reconstruct_features(tmp_path):
 
 
 def test_ast_safety_checker():
-    # 1. Positional shift negative argument
-    with pytest.raises(ValueError, match="Look-ahead bias detected"):
+    # -----------------------------------------------------------------
+    # 1. 基础拦截测试 (位置参数与 shift 关键字)
+    # -----------------------------------------------------------------
+    with pytest.raises(ValueError, match="(?i)look-ahead"):
         AlphaEngine.verify_expression_safety("df['factor'] = df['close'].shift(-1)")
         
-    # 2. Keyword shift negative argument
-    with pytest.raises(ValueError, match="Look-ahead bias detected"):
+    with pytest.raises(ValueError, match="(?i)look-ahead"):
         AlphaEngine.verify_expression_safety("df['factor'] = df['close'].shift(periods=-5)")
 
-    # 3. Positional pct_change negative argument
-    with pytest.raises(ValueError, match="Look-ahead bias detected"):
+    with pytest.raises(ValueError, match="(?i)look-ahead"):
         AlphaEngine.verify_expression_safety("df['factor'] = df['close'].pct_change(-2)")
 
-    # 4. Normal lag operations (positive parameters) must pass
+    # -----------------------------------------------------------------
+    # 【补绝死角一】：拦截 pct_change 的关键字参数逃逸
+    # -----------------------------------------------------------------
+    with pytest.raises(ValueError, match="(?i)look-ahead"):
+        AlphaEngine.verify_expression_safety("df['factor'] = df['close'].pct_change(periods=-1)")
+
+    # -----------------------------------------------------------------
+    # 【补绝死角二】：拦截 iloc/iat[-1] 隐蔽的“上帝视角”全量前瞻
+    # -----------------------------------------------------------------
+    with pytest.raises(ValueError, match="(?i)look-ahead"):
+        AlphaEngine.verify_expression_safety("df['factor'] = df['close'].iloc[-1] / df['close']")
+        
+    with pytest.raises(ValueError, match="(?i)look-ahead"):
+        AlphaEngine.verify_expression_safety("df['factor'] = df['close'].iat[-1]")
+
+    # -----------------------------------------------------------------
+    # 2. 严苛的正向放行测试 (防误杀)
+    # -----------------------------------------------------------------
+    # 正常的滞后/滚动计算必须完美放行
     AlphaEngine.verify_expression_safety("df['factor'] = df['close'].shift(1)")
     AlphaEngine.verify_expression_safety("df['factor'] = df['close'].shift(periods=5)")
     AlphaEngine.verify_expression_safety("df['factor'] = df['close'].pct_change(3)")
+    AlphaEngine.verify_expression_safety("df['factor'] = df['close'].pct_change(periods=2)")
     AlphaEngine.verify_expression_safety("df['factor'] = df['close'] - df['close'].rolling(20).mean()")
+    
+    # 正常的正向索引取值（如取历史第一行数据暖机）必须放行
+    AlphaEngine.verify_expression_safety("df['factor'] = df['close'].iloc[0]")
