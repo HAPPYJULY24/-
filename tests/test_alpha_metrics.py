@@ -283,3 +283,53 @@ def test_signal_export_parquet_carries_metrics_metadata(tmp_path):
     # HIGH-06: Verify audit info is in parquet metadata
     assert b"export_pre_clean_rows" in raw_metadata
     assert b"export_clean_rows" in raw_metadata
+
+
+def test_new_reconstruct_features(tmp_path):
+    # 1. Test Single asset symbol column fallback injection
+    single_asset_df = _make_single_asset_time_series()
+    # verify 'symbol' is not in single_asset_df
+    assert 'symbol' not in single_asset_df.columns
+    
+    # Run signal export
+    df_for_export = single_asset_df.copy()
+    df_for_export['factor'] = df_for_export['score']
+    export_df, audit_info = AlphaEngine.prepare_signal_export(df_for_export)
+    
+    # Assert symbol column was successfully injected and contains 'SINGLE_ASSET'
+    assert 'symbol' in export_df.columns
+    assert (export_df['symbol'] == 'SINGLE_ASSET').all()
+
+    # 2. Test TS mode expanding winsorization and expanding rank (no look-ahead)
+    df_ts_1 = _make_single_asset_time_series()
+    
+    config = _base_config()
+    config['ts_standardization_method'] = 'expanding'
+    config['winsor_method'] = '3-Sigma'
+    
+    res1 = AlphaEngine().process_pipeline(
+        df_ts_1,
+        "df['factor'] = df['score']",
+        config,
+        periods=[1],
+    )
+    
+    # Create df_ts_2 which is identical for the first 20 rows, but has massive outliers in future rows
+    df_ts_2 = df_ts_1.copy()
+    df_ts_2.loc[25:, 'score'] = 1000000.0  # massive future outlier
+    df_ts_2.loc[25:, 'close'] = 1000000.0
+    
+    res2 = AlphaEngine().process_pipeline(
+        df_ts_2,
+        "df['factor'] = df['score']",
+        config,
+        periods=[1],
+    )
+    
+    factor_df1 = res1['signal_df']
+    factor_df2 = res2['signal_df']
+    
+    # Assert that the factor values for the first 15 rows are exactly identical
+    # (No look-ahead leak from future outlier standardisation or winsorisation)
+    pd.testing.assert_series_equal(factor_df1['factor'].head(15), factor_df2['factor'].head(15), check_names=False)
+

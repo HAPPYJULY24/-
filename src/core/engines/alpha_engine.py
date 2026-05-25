@@ -6,7 +6,7 @@ Features: Multi-period IC, Adaptive Panel/TS Mode, Enhanced Statistics.
 
 import pandas as pd
 import numpy as np
-from sklearn.linear_model import Ridge
+from sklearn.linear_model import Ridge, LinearRegression
 from scipy.stats import zscore, t
 import warnings
 
@@ -162,6 +162,39 @@ class AlphaEngine:
             df_ts[target_col] = df_ts[target_col].replace([np.inf, -np.inf], 0.0)
             return df_ts
 
+        def preprocess_ts_expanding(df_ts):
+            """P0-4/Bug B: Expanding winsorization with min_periods=10 warm-up guard to prevent look-ahead bias."""
+            df_ts = df_ts.copy()
+            method = config.get('winsor_method', '3-Sigma')
+            
+            if method == '3-Sigma':
+                expanding_mean = df_ts['factor'].expanding(min_periods=10).mean()
+                expanding_std = df_ts['factor'].expanding(min_periods=10).std()
+                lower = expanding_mean - 3 * expanding_std
+                upper = expanding_mean + 3 * expanding_std
+            elif method == 'MAD':
+                expanding_median = df_ts['factor'].expanding(min_periods=10).median()
+                expanding_mad = (df_ts['factor'] - expanding_median).abs().expanding(min_periods=10).median()
+                k = 1.4826
+                limit = 3 * k * expanding_mad
+                lower = expanding_median - limit
+                upper = expanding_median + limit
+            elif method == 'Quantile':
+                lower = df_ts['factor'].expanding(min_periods=10).quantile(q_lb)
+                upper = df_ts['factor'].expanding(min_periods=10).quantile(q_ub)
+            else:
+                lower = pd.Series(-np.inf, index=df_ts.index)
+                upper = pd.Series(np.inf, index=df_ts.index)
+
+            # Warm-up fallback: use -inf / inf to avoid clipping early rows (cold start)
+            lower = lower.ffill().fillna(-np.inf)
+            upper = upper.ffill().fillna(np.inf)
+
+            # Dynamic clipping of Series vs Series
+            df_ts['factor'] = df_ts['factor'].clip(lower, upper, axis=0)
+            df_ts['factor_winsor'] = df_ts['factor']
+            return df_ts
+
         def preprocess_group(group):
             group = group.copy()
             # HIGH-02 FIX: Skip winsorization+standardization for tiny cross-sections
@@ -190,18 +223,19 @@ class AlphaEngine:
             group['factor_winsor'] = group['factor']
             # B. Standardization
             return standardize_factor_group(group)
-
         # Apply preprocessing
         if is_panel:
              df = df.groupby('datetime', group_keys=False)[df.columns].apply(preprocess_group)
         else:
              # HIGH-03 FIX: TS mode uses config-switchable standardization method
              ts_std_method = config.get('ts_standardization_method', 'expanding')
-             df = preprocess_group(df)  # Always: winsorize + full-sample z-score first
              if ts_std_method == 'expanding':
-                 # Override standardization with expanding window to eliminate look-back bias
+                 # Preprocess with expanding window winsorization to eliminate look-ahead bias
+                 df = preprocess_ts_expanding(df)
                  df = standardize_factor_expanding(df)
-             
+             else:
+                 # Fallback to full-sample winsorization + standardization
+                 df = preprocess_group(df)
         # 3. Neutralization
         risk_factors_raw = config.get('risk_factors', [])
         # logic hardening: ensure all risk factors are lowercase to match normalized df
@@ -239,20 +273,21 @@ class AlphaEngine:
                     X = X_df.values
                     y = valid_group['factor'].values
                     
-                    model = Ridge(alpha=ridge_alpha)
+                    # Switch Ridge to strictly orthogonal OLS (LinearRegression)
+                    model = LinearRegression(fit_intercept=True)
                     model.fit(X, y)
                     
                     preds = model.predict(X)
                     resids = y - preds
                     
                     group.loc[valid_group.index, 'factor'] = resids
-                    # MEDIUM-02 FIX: Mark non-valid rows within this cross-section as NaN
+                    # Mark non-valid rows within this cross-section as NaN (since risk variables X are missing)
                     non_valid_idx = group.index.difference(valid_group.index)
                     if len(non_valid_idx) > 0:
                         group.loc[non_valid_idx, 'factor'] = np.nan
                 else:
-                    # MEDIUM-02 FIX: Entire cross-section failed neutralization → NaN
-                    group['factor'] = np.nan
+                    # Lenient strategy: Keep original values for small cross-sections instead of setting to NaN
+                    pass
                 return group
 
             if is_panel:
@@ -364,8 +399,13 @@ class AlphaEngine:
                 # Time Series Mode: all displayed IC statistics are based on
                 # one rolling Rank IC series to avoid mixed statistical bases.
                 window = min(30, len(eval_period_df) // 2) if len(eval_period_df) > 30 else len(eval_period_df)
-                ranked_factor = eval_period_df['factor'].rank()
-                ranked_ret = eval_period_df[ret_col].rank()
+                # Expanding rank with min_periods=10 warm-up guard to prevent look-ahead bias
+                ranked_factor = eval_period_df['factor'].expanding(min_periods=10).apply(
+                    lambda x: pd.Series(x).rank(pct=True).iloc[-1]
+                ).fillna(eval_period_df['factor'])
+                ranked_ret = eval_period_df[ret_col].expanding(min_periods=10).apply(
+                    lambda x: pd.Series(x).rank(pct=True).iloc[-1]
+                ).fillna(eval_period_df[ret_col])
                 rolling_rank_ic = ranked_factor.rolling(window=window).corr(ranked_ret)
                 
                 # BUG FIX: corr() can sometimes output np.inf or -np.inf due to precision/zero-division,
@@ -538,7 +578,7 @@ class AlphaEngine:
                 'analysis_rows': len(df),
                 'return_valid_rows': int(df[ret_col_primary].notna().sum()) if ret_col_primary and ret_col_primary in df.columns else 0,
                 # MEDIUM-02 FIX: Neutralization coverage tracking
-                'neutralization_coverage': _neutralized_rows / _total_rows if _total_rows > 0 else 1.0,
+                'neutralization_coverage': _neutralized_rows / (_total_rows or 1) if _total_rows > 0 else 1.0,
             },
             # SUPP-01 FIX: Multiple testing session awareness
             'session_test_count': AlphaEngine._session_test_count,
@@ -639,7 +679,14 @@ class AlphaEngine:
             
             # Keep rolling for UI series plot and win rate proxy (Using Spearman/Rank)
             window = min(30, len(valid_df) // 2) if len(valid_df) > 30 else len(valid_df)
-            rolling_rank_ic = valid_df[factor_name].rank().rolling(window=window).corr(valid_df[returns_name].rank())
+            # Expanding rank with min_periods=10 warm-up guard to prevent look-ahead bias
+            ranked_factor_pro = valid_df[factor_name].expanding(min_periods=10).apply(
+                lambda x: pd.Series(x).rank(pct=True).iloc[-1]
+            ).fillna(valid_df[factor_name])
+            ranked_ret_pro = valid_df[returns_name].expanding(min_periods=10).apply(
+                lambda x: pd.Series(x).rank(pct=True).iloc[-1]
+            ).fillna(valid_df[returns_name])
+            rolling_rank_ic = ranked_factor_pro.rolling(window=window).corr(ranked_ret_pro)
             # Safely replace Inf values from Zero-Division correlation anomalies
             rolling_rank_ic = rolling_rank_ic.replace([np.inf, -np.inf], np.nan).dropna()
             rank_ic_mean = rolling_rank_ic.mean()
@@ -809,12 +856,15 @@ class AlphaEngine:
             elif 'volume' not in df.columns and len(volume_candidates) == 1 and c == volume_candidates[0]:
                 df['volume'] = df[c]
 
+        # DOWNSTREAM BACKTEST COMPATIBILITY: Force 'symbol' to exist for single asset modes
+        if 'symbol' not in df.columns:
+            df['symbol'] = 'SINGLE_ASSET'
+
         # 2. Validation
-        required = ['close', 'factor']
+        required = ['close', 'factor', 'symbol']
         missing = [c for c in required if c not in df.columns]
         if missing:
             raise ValueError(f"Missing core columns required for Export: {missing}.")
-
         # Ensure datetime
         if 'datetime' in df.columns:
             df['datetime'] = pd.to_datetime(df['datetime'])
