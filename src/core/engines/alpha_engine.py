@@ -9,6 +9,8 @@ import numpy as np
 from sklearn.linear_model import Ridge, LinearRegression
 from scipy.stats import zscore, t
 import warnings
+import ast
+
 
 class AlphaEngine:
     """
@@ -23,6 +25,47 @@ class AlphaEngine:
     
     def __init__(self):
         pass
+
+    @staticmethod
+    def verify_expression_safety(expression: str) -> None:
+        """
+        CRITICAL-01: Verify the factor expression dynamically using AST.
+        Raises ValueError if any negative shift or look-ahead patterns are detected.
+        """
+        if not expression:
+            return
+        try:
+            tree = ast.parse(expression)
+        except SyntaxError as e:
+            raise ValueError(f"Expression syntax error: {str(e)}")
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                func_name = getattr(node.func, 'attr', None)
+                if func_name in {'shift', 'pct_change'}:
+                    # 1. Check positional arguments
+                    for arg in node.args:
+                        # Negative UnaryOp (e.g. -1)
+                        if isinstance(arg, ast.UnaryOp) and isinstance(arg.op, ast.USub):
+                            if isinstance(arg.operand, ast.Constant) and arg.operand.value > 0:
+                                raise ValueError(f"Look-ahead bias detected: negative argument in {func_name}() is forbidden.")
+                            elif isinstance(arg.operand, ast.Num) and arg.operand.n > 0:
+                                raise ValueError(f"Look-ahead bias detected: negative argument in {func_name}() is forbidden.")
+                        # Negative constant literals directly
+                        elif isinstance(arg, ast.Constant) and isinstance(val := getattr(arg, 'value', None), (int, float)) and val < 0:
+                            raise ValueError(f"Look-ahead bias detected: negative argument in {func_name}() is forbidden.")
+
+                    # 2. Check keyword arguments (e.g. periods=-5)
+                    for kw in node.keywords:
+                        if kw.arg in {'periods', 'periods_y', 'periods_x'}:
+                            val_node = kw.value
+                            if isinstance(val_node, ast.UnaryOp) and isinstance(val_node.op, ast.USub):
+                                if isinstance(val_node.operand, ast.Constant) and val_node.operand.value > 0:
+                                    raise ValueError(f"Look-ahead bias detected: negative keyword argument '{kw.arg}' in {func_name}() is forbidden.")
+                                elif isinstance(val_node.operand, ast.Num) and val_node.operand.n > 0:
+                                    raise ValueError(f"Look-ahead bias detected: negative keyword argument '{kw.arg}' in {func_name}() is forbidden.")
+                            elif isinstance(val_node, ast.Constant) and isinstance(val := getattr(val_node, 'value', None), (int, float)) and val < 0:
+                                raise ValueError(f"Look-ahead bias detected: negative keyword argument '{kw.arg}' in {func_name}() is forbidden.")
 
     @staticmethod
     def _clean_stat_value(value, default=0.0):
@@ -67,8 +110,10 @@ class AlphaEngine:
             periods (list): Forward return periods to evaluate (default: [1, 5, 10, 20]).
             
         Returns:
-            dict: Result dictionary containing metrics, ic_series, quantile_returns, ic_decay_table etc.
         """
+        # CRITICAL-01: Proactive AST safety check to block negative shifts
+        self.verify_expression_safety(expression)
+
         # 0. Data Preparation
         AlphaEngine._session_test_count += 1  # SUPP-01: Track session test count
         df = df.copy()

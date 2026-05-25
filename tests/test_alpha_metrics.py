@@ -1,5 +1,5 @@
 import os
-
+import pytest
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
@@ -333,3 +333,22 @@ def test_new_reconstruct_features(tmp_path):
     # (No look-ahead leak from future outlier standardisation or winsorisation)
     pd.testing.assert_series_equal(factor_df1['factor'].head(15), factor_df2['factor'].head(15), check_names=False)
 
+
+def test_ast_safety_checker():
+    # 1. Positional shift negative argument
+    with pytest.raises(ValueError, match="Look-ahead bias detected"):
+        AlphaEngine.verify_expression_safety("df['factor'] = df['close'].shift(-1)")
+        
+    # 2. Keyword shift negative argument
+    with pytest.raises(ValueError, match="Look-ahead bias detected"):
+        AlphaEngine.verify_expression_safety("df['factor'] = df['close'].shift(periods=-5)")
+
+    # 3. Positional pct_change negative argument
+    with pytest.raises(ValueError, match="Look-ahead bias detected"):
+        AlphaEngine.verify_expression_safety("df['factor'] = df['close'].pct_change(-2)")
+
+    # 4. Normal lag operations (positive parameters) must pass
+    AlphaEngine.verify_expression_safety("df['factor'] = df['close'].shift(1)")
+    AlphaEngine.verify_expression_safety("df['factor'] = df['close'].shift(periods=5)")
+    AlphaEngine.verify_expression_safety("df['factor'] = df['close'].pct_change(3)")
+    AlphaEngine.verify_expression_safety("df['factor'] = df['close'] - df['close'].rolling(20).mean()")
