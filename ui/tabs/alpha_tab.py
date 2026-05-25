@@ -714,7 +714,25 @@ class AlphaTab(QWidget):
     def _on_worker_error(self, message):
         self._set_loading_state(False)
         self._log(f"ERROR: {message}")
-        QMessageBox.critical(self, "Execution Error", message)
+        
+        # Create an explicit QMessageBox object for a professional warning interface
+        msg_box = QMessageBox(self)
+        msg_box.setIcon(QMessageBox.Icon.Critical)
+        
+        # Intelligent detection of look-ahead safety violations
+        message_lower = message.lower()
+        if any(kw in message_lower for kw in ["look-ahead", "ast intercept", "negative shift"]):
+            msg_box.setWindowTitle("因子计算熔断")
+            msg_box.setText("🚨 [前瞻偏差阻断] 用户输入的因子表达式触发了计算引擎层 AST 静态安全拦截，前瞻毒素注入已被强制熔断！")
+            msg_box.setInformativeText("引擎已拦截非法的未来数据访问请求，请修正 shift(-N) 或 iloc[-1] 等前瞻语法。")
+        else:
+            msg_box.setWindowTitle("Execution Error")
+            msg_box.setText("An unexpected error occurred during factor pipeline execution.")
+            msg_box.setInformativeText("Please check the details below or review the factor expression syntax.")
+            
+        # Set detailed traceback text foldout
+        msg_box.setDetailedText(message)
+        msg_box.exec()
 
     def _on_worker_finished(self, result):
         """Handle worker completion."""
