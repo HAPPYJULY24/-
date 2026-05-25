@@ -123,6 +123,27 @@ quant-data-bridge/
 
 ---
 
+### 🆕 Wind-Control & Friction Upgrades (v2.7)
+
+#### 🚀 Core Trading & Settlement Logic
+- ✅ **Short Position Ghost Stop-Loss Fix**: Upgraded unsigned lots sync to signed position tracking (`current_pos_signed`), completely resolving the 100% false stop-out trigger for short positions.
+- ✅ **Look-Ahead Bias Elimination**: Exempted the signal generation bar from stop checks in vectorized `Close` mode, ensuring a mathematically clean backtest timeline.
+- ✅ **Timeline & Whiplash Correction**: Realigned entry price shifts for `Close` and `Next Open` modes, preventing the first bar's returns from being wiped to zero.
+
+#### 🛡️ Wind-Control & Compliance (Drawdowns & Margin)
+- ✅ **Overnight Gap Risk Protection**: Real-time daily drawdown calculation dynamically utilizes yesterday's closing equity (`_last_bar_equity`) as the baseline on day change, correctly capturing large overnight openings.
+- ✅ **Dual-Track Circuit Breakers**: Standardized daily (20%) and peak (35%) drawdown breakers, immediately liquidating the account and halting opening orders when tripped.
+- ✅ **Deadlock-Mitigated Validation**: Added `is_exit` to order requests, allowing exit/reducing orders to bypass liquidation blocks and avoiding account freezes.
+- ✅ **Double-Sided Friction Costs**: Applied commission and slippage double-sided (both at entry and exit), aligning engines and trade performance logs.
+- ✅ **Maintenance Margin Buffer**: Used maintenance margin (`0.8 * initial_margin`) as the liquidation line, providing a 20% cushion to protect strategy resilience.
+
+#### 💻 UI Stability & Interactive Rendering
+- ✅ **Zero-Crash Visualization**: Protected plotting methods in `risk_tab.py` and `risk_dashboard_charts.py` to seamlessly fallback to sequential indexing (`np.arange`) for RangeIndex/string indexes.
+- ✅ **Pyqtgraph Dual-Axis Lock-Sync**: Linked the right axis ViewBox (`p2`) to the underlying main ViewBox (`p1.vb`) and bound resizing to a class-held method (`_update_right_axis_geometry`), preventing GC disconnection.
+- ✅ **Interactive Pass-Through & Connection De-duplication**: Disabled X-axis mouse events on `p2` to allow mouse-event pass-through to `p1`, and de-duplicated signal connection calls using `disconnect` try-except handler to prevent performance degradation.
+
+---
+
 ## 🚀 Quick Start
 
 ### Installation

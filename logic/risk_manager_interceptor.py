@@ -65,6 +65,12 @@ class Account_State:
     current_pos: int = 0  # +ve for Long, -ve for Short
     max_drawdown: float = 0.0
     is_liquidated: bool = False
+    liquidation_reason: str = ""
+    
+    @property
+    def maintenance_margin(self) -> float:
+        """Dynamic maintenance margin baseline (80% of used initial margin)"""
+        return self.used_margin * 0.8
     
     @property
     def free_margin(self) -> float:
@@ -72,9 +78,10 @@ class Account_State:
     
     @property
     def margin_level(self) -> float:
-        if self.used_margin == 0:
+        maint = self.maintenance_margin
+        if maint == 0:
             return float('inf')
-        return self.equity / self.used_margin
+        return self.equity / maint
 
 
 class RiskManager:
@@ -112,6 +119,12 @@ class RiskManager:
         self.multiplier = config.multiplier
         self.initial_capital = config.initial_capital
         
+        # Drawdown monitoring baseline
+        self._high_water_mark = config.initial_capital
+        self._daily_baseline_equity = config.initial_capital
+        self._last_bar_equity = config.initial_capital
+        self._current_day = None
+        
         # Audit Log
         self.audit_log = []
     
@@ -119,7 +132,7 @@ class RiskManager:
     # BACKWARD COMPATIBILITY (Puppet Mode Methods)
     # ============================================================================
     
-    def sync_account_state(self, balance: float, equity: float, current_pos: int, used_margin: float):
+    def sync_account_state(self, balance: float, equity: float, current_pos: int, used_margin: float, current_date=None):
         """
         Puppet Mode: Passive State Sync (BACKWARD COMPATIBLE).
         Accept state from BacktestEngine.
@@ -129,9 +142,43 @@ class RiskManager:
         self.state.current_pos = current_pos
         self.state.used_margin = used_margin
         
-        # Liquidation check
+        # 1. Daily baseline tracking with Gap Risk Protection
+        if current_date is not None:
+            bar_day = current_date.date() if hasattr(current_date, 'date') else str(current_date)[:10]
+            if self._current_day != bar_day:
+                # Today's baseline is yesterday's final closing equity to capture Overnight Gap risk
+                self._daily_baseline_equity = getattr(self, '_last_bar_equity', equity)
+                self._current_day = bar_day
+                
+        # Cache current Bar equity for the next day's reset
+        self._last_bar_equity = equity
+            
+        # 2. Update High-Water Mark
+        if equity > self._high_water_mark:
+            self._high_water_mark = equity
+            
+        # 3. Compute drawdown metrics
+        peak_drawdown = (self._high_water_mark - equity) / self._high_water_mark if self._high_water_mark > 0 else 0.0
+        daily_drawdown = (self._daily_baseline_equity - equity) / self._daily_baseline_equity if self._daily_baseline_equity > 0 else 0.0
+        
+        # 4. Check for liquidations (Drawdown & Margin Call)
+        if peak_drawdown > 0.35:
+            self.state.is_liquidated = True
+            self.state.liquidation_reason = f"Peak Drawdown Breach: {peak_drawdown:.2%} > 35%"
+            return
+            
+        if daily_drawdown > 0.20:
+            self.state.is_liquidated = True
+            self.state.liquidation_reason = f"Daily Drawdown Breach: {daily_drawdown:.2%} > 20%"
+            return
+            
+        # 5. Margin Call Liquidation check (using Maintenance Margin)
         if self.state.margin_level < 1.0:
             self.state.is_liquidated = True
+            self.state.liquidation_reason = (
+                f"Margin Call Liquidation: Equity ({self.state.equity:.2f}) "
+                f"fell below Maintenance Margin ({self.state.maintenance_margin:.2f})"
+            )
     
     def check_regime(self, row: pd.Series, signal: int) -> int:
         """
@@ -255,6 +302,14 @@ class RiskManager:
         Returns:
             OrderResponse (approved/rejected with reason)
         """
+        # Wind-control Interceptor Check: Reject all new entries if liquidated, but allow exit orders
+        if getattr(self.state, 'is_liquidated', False):
+            if not getattr(order, 'is_exit', False):
+                reason = getattr(self.state, 'liquidation_reason', "Account Liquidated")
+                response = OrderResponse.reject(reason=f"Rejected: {reason}. Opening forbidden.")
+                self._log_rejection(order, response)
+                return response
+            
         # Layer 1: Regime Check
         regime_response = self._check_regime_layer(order)
         if not regime_response.approved:
@@ -331,9 +386,10 @@ class RiskManager:
         
         # Absolute Veto: Max Position Size
         if target_lots > self.config.max_position_size:
+            adjusted_vol = min(self.config.max_position_size, order.volume)
             return OrderResponse.adjust(
                 original_volume=order.volume,
-                adjusted_volume=self.config.max_position_size,
+                adjusted_volume=adjusted_vol,
                 reason=f"Position Sizing: Target {target_lots} exceeds DNA max ({self.config.max_position_size})"
             )
             

@@ -31,6 +31,7 @@ class OrderRequest:
     timestamp: Optional[datetime] = None
     atr: float = 0.0
     adx: float = 0.0
+    is_exit: bool = False
     
     def __post_init__(self):
         """Validate order request fields."""
@@ -58,7 +59,8 @@ class OrderRequest:
             'price': self.price,
             'timestamp': str(self.timestamp) if self.timestamp else None,
             'atr': self.atr,
-            'adx': self.adx
+            'adx': self.adx,
+            'is_exit': self.is_exit
         }
 
 

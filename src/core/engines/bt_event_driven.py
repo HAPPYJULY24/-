@@ -174,7 +174,7 @@ class EventDrivenBacktest:
                         direction_mult = 1 if dir_val == "LONG" or dir_val == 1 else -1
                         pnl_gross = (exit_price - current_position.avg_entry_price) * direction_mult * multiplier * lots_closed
                         cost_val = (commission + (slippage * multiplier)) * lots_closed
-                        pnl_net = pnl_gross - cost_val
+                        pnl_net = pnl_gross - 2 * cost_val
                         
                         # GUARD: trades_list.append is ONLY called inside pending_action block
                         trades_list.append({
@@ -188,7 +188,7 @@ class EventDrivenBacktest:
                             'exit_reason': "Signal_Close"
                         })
                         
-                        current_balance += pnl_net
+                        current_balance += pnl_gross - cost_val
                         net_pnl_arr[i] = pnl_net  # FIX: was never written — now recorded immediately
                         current_position = None
                         
@@ -231,6 +231,10 @@ class EventDrivenBacktest:
                                 entered_this_bar_index = i
                                 self._emit_log(f"✅ [{row.Index}] PHASE I — T+1 Entry: {order_request.direction_str} x{lots} at OPEN {row.open:.2f}")
                                 executed_this_bar = True
+                                
+                                # Deduct entry friction (single-side cost)
+                                entry_cost = (commission + (slippage * multiplier)) * lots
+                                current_balance -= entry_cost
                         else:
                             # Legacy fallback (no validate_order)
                             lots = rm.calculate_lots(atr_val)
@@ -247,6 +251,10 @@ class EventDrivenBacktest:
                                 entered_this_bar_index = i
                                 self._emit_log(f"✅ [{row.Index}] PHASE I — T+1 Entry (Legacy): {pending_action} x{lots} at OPEN {row.open:.2f}")
                                 executed_this_bar = True
+                                
+                                # Deduct entry friction (single-side cost)
+                                entry_cost = (commission + (slippage * multiplier)) * lots
+                                current_balance -= entry_cost
                 
                 # Step I-2: Destroy the pending order object — it is now consumed
                 pending_action = 0
@@ -274,8 +282,12 @@ class EventDrivenBacktest:
             current_used_margin = current_position.margin_used if current_position else 0.0
             
             # Step II-2: Sync RiskManager with current account snapshot
-            current_pos_lots = current_position.lots if current_position else 0
-            rm.sync_account_state(current_balance, current_equity, current_pos_lots, current_used_margin)
+            if current_position and current_position.lots > 0:
+                direction_sign = 1 if current_position.direction == TradeDirection.LONG else -1
+                current_pos_signed = current_position.lots * direction_sign
+            else:
+                current_pos_signed = 0
+            rm.sync_account_state(current_balance, current_equity, current_pos_signed, current_used_margin, current_date=row.Index)
             
             # --- [CRITICAL VULNERABILITY FIX]: MARGIN CALL ENFORCEMENT ---
             if getattr(rm.state, 'is_liquidated', False) and current_position is not None and current_position.lots > 0:
@@ -286,7 +298,7 @@ class EventDrivenBacktest:
                 # Liquidation executed at current bar's close price (Margin Call Market Order)
                 pnl_gross = (row.close - current_position.avg_entry_price) * direction_mult * multiplier * lots_closed
                 cost_val = (commission + (slippage * multiplier)) * lots_closed
-                pnl_net = pnl_gross - cost_val
+                pnl_net = pnl_gross - 2 * cost_val
                 
                 trades_list.append({
                     'entry_time': current_position.entry_time,
@@ -299,7 +311,7 @@ class EventDrivenBacktest:
                     'exit_reason': "Margin_Call"
                 })
                 
-                current_balance += pnl_net
+                current_balance += pnl_gross - cost_val
                 current_position = None
                 just_closed = True
                 
@@ -354,7 +366,7 @@ class EventDrivenBacktest:
                         direction_mult = 1 if dir_val == "LONG" or dir_val == 1 else -1
                         pnl_gross = (stop_exit_price - current_position.avg_entry_price) * direction_mult * multiplier * lots_closed
                         cost_val = (commission + (slippage * multiplier)) * lots_closed
-                        pnl_net = pnl_gross - cost_val
+                        pnl_net = pnl_gross - 2 * cost_val
                         
                         # GUARD: append strictly inside this risk-intervention block
                         trades_list.append({
@@ -368,7 +380,7 @@ class EventDrivenBacktest:
                             'exit_reason': reason
                         })
                         
-                        current_balance += pnl_net
+                        current_balance += pnl_gross - cost_val
                         current_position = None
                         just_closed = True
                         is_intra_closed = True
@@ -402,7 +414,7 @@ class EventDrivenBacktest:
                 direction_mult = 1 if dir_val == "LONG" or dir_val == 1 else -1
                 pnl_gross = (exit_price - current_position.avg_entry_price) * direction_mult * multiplier * lots_closed
                 cost_val = (commission + (slippage * multiplier)) * lots_closed
-                pnl_net = pnl_gross - cost_val
+                pnl_net = pnl_gross - 2 * cost_val
                 
                 trades_list.append({
                     'entry_time': current_position.entry_time,
@@ -415,7 +427,7 @@ class EventDrivenBacktest:
                     'exit_reason': force_exit_reason
                 })
                 
-                current_balance += pnl_net
+                current_balance += pnl_gross - cost_val
                 current_position = None
                 just_closed = True
                 
@@ -491,7 +503,7 @@ class EventDrivenBacktest:
             direction_mult = 1 if dir_val == "LONG" or dir_val == 1 else -1
             pnl_gross = (exit_price - current_position.avg_entry_price) * direction_mult * multiplier * lots_closed
             cost_val = (commission + (slippage * multiplier)) * lots_closed
-            pnl_net = pnl_gross - cost_val
+            pnl_net = pnl_gross - 2 * cost_val
             
             trades_list.append({
                 'entry_time': current_position.entry_time,
@@ -504,7 +516,7 @@ class EventDrivenBacktest:
                 'exit_reason': "End_Of_Data"
             })
             
-            current_balance += pnl_net
+            current_balance += pnl_gross - cost_val
             current_equity = current_balance
         
         # === STEP 7: Compile results ===

@@ -263,11 +263,6 @@ class VectorizedBacktest:
             # Basic PnL
             df['gross_pnl'] = df['price_change'] * multiplier * df['pos']
         
-        # Recalculate PnL for non-stop bars
-        mask_normal = (df['exit_type'] == 'Signal')
-        df.loc[mask_normal, 'gross_pnl'] = (df.loc[mask_normal, 'price_change'] * 
-                                             multiplier * df.loc[mask_normal, 'pos'])
-        
         # Transaction Costs
         df['pos_change'] = df['pos'].diff().abs().fillna(0)
         cost_per_lot = commission + (slippage * multiplier)
@@ -278,42 +273,80 @@ class VectorizedBacktest:
     
     def _apply_stop_loss(self, df: pd.DataFrame, sl_pct: float, multiplier: float,
                          execution_mode: str) -> pd.DataFrame:
-        """Apply vectorized stop loss logic."""
-        # Identify trade IDs
+        """Apply vectorized stop loss logic without look-ahead bias."""
+        # 1. Identify trade IDs
         df['trade_id'] = (df['pos'] != df['pos'].shift(1).fillna(0)).cumsum()
         
-        # Get entry prices
-        entry_prices = df.groupby('trade_id')['exec_price'].transform('first')
+        # 2. Get entry prices (aligned to correct entry bar price)
+        if execution_mode == 'Next Open':
+            df['entry_price'] = df['open'].shift(1)
+        else:
+            df['entry_price'] = df['close'].shift(1)
+        
+        entry_prices = df.groupby('trade_id')['entry_price'].transform('first')
         df['entry_price'] = entry_prices
         
-        # Calculate SL prices
-        sl_prices = np.where(df['pos'] > 0,
-                            df['entry_price'] * (1 - sl_pct/100.0),
-                            df['entry_price'] * (1 + sl_pct/100.0))
+        # 3. Calculate SL prices
+        df['sl_prices'] = np.where(df['pos'] > 0,
+                                   df['entry_price'] * (1 - sl_pct/100.0),
+                                   df['entry_price'] * (1 + sl_pct/100.0))
         
-        # Check for hits
-        hit_long = (df['pos'] > 0) & (df['low'] < sl_prices)
-        hit_short = (df['pos'] < 0) & (df['high'] > sl_prices)
-        is_hit = hit_long | hit_short
+        # 4. Identify Signal Generation Bar (Signal Bar)
+        # In Close mode, T is signal bar (pos[T]=0, pos[T+1]!=0)
+        if execution_mode == 'Close':
+            signal_bar_mask = (df['pos'] == 0) & (df['pos'].shift(-1).fillna(0) != 0)
+        else:
+            signal_bar_mask = pd.Series(False, index=df.index)
         
-        # Cumulative hits per trade
+        # 5. Check for hits with look-ahead bias eliminated (Signal Bar is exempted, First Holding Bar is checked!)
+        if execution_mode == 'Close':
+            hit_long = (df['pos'] > 0) & (df['low'] < df['sl_prices']) & (~signal_bar_mask)
+            hit_short = (df['pos'] < 0) & (df['high'] > df['sl_prices']) & (~signal_bar_mask)
+        else:
+            hit_long = (df['pos'] > 0) & (df['low'] < df['sl_prices'])
+            hit_short = (df['pos'] < 0) & (df['high'] > df['sl_prices'])
+            
+        df['is_sl_triggered'] = hit_long | hit_short
+        
+        # 6. Cumulative hits per trade to stop out subsequent bars
+        is_hit = df['is_sl_triggered']
         cum_hits = pd.Series(is_hit, index=df.index).groupby(df['trade_id']).cumsum()
         first_hit_mask = (cum_hits == 1) & (is_hit)
         post_hit_mask = (cum_hits > 0) & (~first_hit_mask)
         
-        # Apply stop logic
-        df.loc[post_hit_mask, 'pos'] = 0
-        df.loc[post_hit_mask, 'gross_pnl'] = 0
-        
-        # Calculate SL PnL
-        if execution_mode == 'Next Open':
-            ref_price = df['open'].shift(1)
-        else:
-            ref_price = df['close'].shift(1)
-        
-        sl_pnl = (sl_prices - ref_price) * multiplier * df['pos']
-        df.loc[first_hit_mask, 'gross_pnl'] = sl_pnl
+        df['exit_type'] = 'Signal'
         df.loc[first_hit_mask, 'exit_type'] = 'Intra-bar SL'
+        df.loc[post_hit_mask, 'exit_type'] = 'Post SL'
+        
+        # Apply stop-out to subsequent bars (position goes to 0)
+        df.loc[post_hit_mask, 'pos'] = 0
+        
+        # 7. Reference price logic (dynamic ref price)
+        position_changed = df['pos'] != df['pos'].shift(1).fillna(0)
+        first_bar_mask = (df['pos'] != 0) & position_changed
+        
+        if execution_mode == 'Next Open':
+            standard_ref = df['open'].shift(1)
+        else:
+            standard_ref = df['close'].shift(1)
+            
+        df['ref_price'] = np.where(first_bar_mask, df['entry_price'], standard_ref)
+        
+        # 8. Calculate standard and stop PnL
+        current_price = df['open'] if execution_mode == 'Next Open' else df['close']
+        df['normal_pnl'] = (current_price - df['ref_price']) * multiplier * df['pos']
+        df['sl_pnl'] = (df['sl_prices'] - df['ref_price']) * multiplier * df['pos']
+        
+        # Assemble final gross PnL
+        df['gross_pnl'] = np.where(
+            df['exit_type'] == 'Intra-bar SL',
+            df['sl_pnl'],
+            np.where(
+                df['exit_type'] == 'Post SL',
+                0.0,
+                df['normal_pnl']
+            )
+        )
         
         return df
     

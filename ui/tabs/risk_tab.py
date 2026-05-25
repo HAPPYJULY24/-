@@ -541,12 +541,16 @@ class RiskTab(QWidget):
             if df is None or (hasattr(df, 'empty') and df.empty):
                 return
             idx = df.index
-            try:
-                ts = idx.astype('int64') // 10**9
-            except Exception:
-                ts = np.arange(len(idx))
+            if isinstance(idx, pd.DatetimeIndex):
+                try:
+                    ts = idx.astype('int64') // 10**9
+                    ts_vals = ts.values if hasattr(ts, 'values') else ts
+                except Exception:
+                    ts_vals = np.arange(len(idx))
+            else:
+                ts_vals = np.arange(len(idx))
             eq = df['equity'].values if 'equity' in df.columns else np.zeros(len(df))
-            self.plot_widget.plot(ts.values, eq, pen=pen, name=name)
+            self.plot_widget.plot(ts_vals, eq, pen=pen, name=name)
 
         _plot(base_df,     pg.mkPen('#888888', width=2, style=Qt.PenStyle.DashLine),
               'Base (Gross)')

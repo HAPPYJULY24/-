@@ -46,10 +46,16 @@ class RiskDashboardCharts(QWidget):
         self.p2 = None
     
     def _get_timestamps(self, df):
-        """Convert DataFrame index to Unix timestamp array."""
+        """Convert DataFrame index to Unix timestamp array with fallback for non-datetime index."""
         if df.empty:
             return np.array([])
-        return df.index.astype(np.int64).values // 10**9
+        if isinstance(df.index, pd.DatetimeIndex):
+            try:
+                ts = df.index.astype(np.int64) // 10**9
+                return ts.values if hasattr(ts, 'values') else ts
+            except Exception:
+                pass
+        return np.arange(len(df))
     
     def update_chart(self, base_df, audit_df):
         """
@@ -93,14 +99,19 @@ class RiskDashboardCharts(QWidget):
             p1.scene().addItem(self.p2)
             p1.getAxis('right').linkToView(self.p2)
             p1.getAxis('right').setLabel('Used Margin (RM)', color='#2196F3')
-            self.p2.setXLink(p1)
             
-            # Connect resize signal
-            def updateViews():
-                self.p2.setGeometry(p1.vb.sceneBoundingRect())
-                self.p2.linkedViewChanged(p1.vb, self.p2.XAxis)
+            # Link to underlying ViewBox instead of PlotItem
+            self.p2.setXLink(p1.vb)
             
-            p1.vb.sigResized.connect(updateViews)
+            # Disable X mouse events, only allow Y control to prevent event blocking
+            self.p2.setMouseEnabled(x=False, y=True)
+            
+            # Connect resize signal safely (GC-defended & signal accumulation proofed)
+            try:
+                p1.vb.sigResized.disconnect(self._update_right_axis_geometry)
+            except TypeError:
+                pass
+            p1.vb.sigResized.connect(self._update_right_axis_geometry)
         else:
             # Clear previous margin plots
             self.p2.clear()
@@ -135,12 +146,18 @@ class RiskDashboardCharts(QWidget):
             )
             self.p2.addItem(stress_fill)
             
-            # Force geometry update
-            self.p2.setGeometry(p1.vb.sceneBoundingRect())
-            self.p2.linkedViewChanged(p1.vb, self.p2.XAxis)
+            # Force geometry update using member method
+            self._update_right_axis_geometry()
     
     def clear(self):
         """Clear all charts."""
         self.plot_widget.clear()
         if self.p2 is not None:
             self.p2.clear()
+            
+    def _update_right_axis_geometry(self):
+        """Synchronize the geometry of the right ViewBox to match the main PlotItem's ViewBox."""
+        p1 = self.plot_widget.getPlotItem()
+        if p1 is not None and self.p2 is not None:
+            self.p2.setGeometry(p1.vb.sceneBoundingRect())
+            self.p2.linkedViewChanged(p1.vb, self.p2.XAxis)
