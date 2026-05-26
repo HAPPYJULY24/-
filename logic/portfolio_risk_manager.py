@@ -129,27 +129,49 @@ class PortfolioRiskManager:
         multiplier: float = 1.0
     ) -> None:
         """
-        Update or create a position in the portfolio.
+        Update or create a position in the portfolio with scale-in, scale-out,
+        reversal, and full-close accounting.
         
         Args:
             symbol: Asset symbol
             asset_type: Asset type
-            quantity: Position size
-            price: Current price
+            quantity: Position size (positive = long, negative = short, 0 = flat)
+            price: Execution price
             multiplier: Contract multiplier
         """
-        if symbol in self.positions:
-            pos = self.positions[symbol]
-            pos.update_price(price, multiplier)
+        if symbol not in self.positions:
+            if quantity != 0:
+                self.positions[symbol] = PortfolioPosition(
+                    symbol=symbol,
+                    asset_type=asset_type,
+                    quantity=quantity,
+                    avg_price=price,
+                    current_price=price
+                )
         else:
-            pos = PortfolioPosition(
-                symbol=symbol,
-                asset_type=asset_type,
-                quantity=quantity,
-                avg_price=price,
-                current_price=price
-            )
-            self.positions[symbol] = pos
+            pos = self.positions[symbol]
+            if quantity == 0:
+                self.positions.pop(symbol)
+                return
+                
+            # A. Reversal scenario: direction of position changes
+            if np.sign(quantity) != np.sign(pos.quantity):
+                pos.avg_price = price
+                pos.asset_type = asset_type
+            
+            # B. Scale-in scenario: same direction, size increases in absolute terms
+            elif abs(quantity) > abs(pos.quantity):
+                added_lots = abs(quantity - pos.quantity)
+                old_total_cost = pos.avg_price * abs(pos.quantity)
+                new_incremental_cost = price * added_lots
+                pos.avg_price = (old_total_cost + new_incremental_cost) / abs(quantity)
+                
+            # C. Scale-out scenario: same direction, size decreases in absolute terms
+            # Average entry price remains unchanged.
+            
+            # Update quantity and recalculate PnL at the new price
+            pos.quantity = quantity
+            pos.update_price(price, multiplier)
     
     def get_portfolio_summary(self) -> Dict:
         """

@@ -518,6 +518,7 @@ class EventDrivenBacktest:
             
             current_balance += pnl_gross - cost_val
             current_equity = current_balance
+            net_pnl_arr[-1] = pnl_net
         
         # === STEP 7: Compile results ===
         df = df.copy()

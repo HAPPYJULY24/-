@@ -20,6 +20,8 @@ class RiskConfig:
     multiplier: float
     adx_filter_enabled: bool
     adx_threshold: float = 20.0  # Optional fallback if needed by legacy
+    leverage_limit: float = 10.0  # Hard leverage limit
+    sl_pct: float = 0.0  # Fixed stop-loss percentage
 
     @staticmethod
     def from_dna(json_path: str) -> "RiskConfig":
@@ -33,7 +35,9 @@ class RiskConfig:
             risk_target_pct=float(dna["backtest_risk_settings"].get("risk_target_pct", 1.0)),
             max_position_size=int(dna["backtest_risk_settings"]["max_position_size"]),
             multiplier=float(dna["friction_costs"]["multiplier"]),
-            adx_filter_enabled=bool(dna["execution_constraints"]["adx_filter_enabled"])
+            adx_filter_enabled=bool(dna["execution_constraints"]["adx_filter_enabled"]),
+            leverage_limit=float(dna["backtest_risk_settings"].get("leverage_limit", 10.0)),
+            sl_pct=float(dna["backtest_risk_settings"].get("stop_loss_value", 0.0))
         )
 
 # Import Phase 1 models
@@ -205,9 +209,9 @@ class RiskManager:
         
         return signal
     
-    def calculate_lots(self, atr: float, stop_loss_dist: float = 0.0) -> int:
+    def calculate_lots(self, atr: float, entry_price: float = 0.0, stop_loss_dist: float = 0.0) -> int:
         """
-        BACKWARD COMPATIBLE: Legacy position sizing.
+        BACKWARD COMPATIBLE: Legacy position sizing with math alignment.
         For use in old code that doesn't use OrderRequest.
         """
         if atr is None or pd.isna(atr) or atr <= 0:
@@ -215,10 +219,19 @@ class RiskManager:
         
         sizing_equity = min(self.initial_capital, self.state.equity)
         risk_amount = sizing_equity * self.params['risk_per_trade']
-        volatility_value = atr * self.multiplier
+        
+        # Pyramid risk distance priority
+        if stop_loss_dist > 0.0:
+            risk_distance = stop_loss_dist
+        elif self.config.sl_pct > 0.0 and entry_price > 0.0:
+            risk_distance = entry_price * (self.config.sl_pct / 100.0)
+        else:
+            risk_distance = atr * 2.0
+            
+        volatility_value = risk_distance * self.multiplier
         
         if volatility_value == 0:
-            return 0
+            return 1  # Minimum defensive lots
         
         target_lots = int(risk_amount / volatility_value)
         
@@ -229,8 +242,8 @@ class RiskManager:
         else:
             max_allowed_lots = 999
         
-        final_lots = min(target_lots, max_allowed_lots, 20)  # Hard cap at 20
-        final_lots = max(0, final_lots)
+        final_lots = min(target_lots, max_allowed_lots, self.config.max_position_size)
+        final_lots = max(1, final_lots)  # Minimum 1 lot if sized
         
         if final_lots < target_lots:
             self.audit_log.append({
@@ -289,12 +302,13 @@ class RiskManager:
     
     def validate_order(self, order: OrderRequest) -> OrderResponse:
         """
-        3-Layer Order Validation Pipeline (INTERCEPTOR PATTERN).
+        4-Layer Order Validation Pipeline (INTERCEPTOR PATTERN).
         
         Pipeline:
         1. Layer 1: check_regime_layer (ADX filtering)
-        2. Layer 2: calculate_risk_pos_layer (ATR-based sizing + margin check)
-        3. Layer 3: check_margin_layer (AssetConfig-based margin sufficiency)
+        2. Layer 2: calculate_risk_pos_layer (ATR/sl_pct-aligned sizing)
+        3. Layer 3: check_margin_layer (Margin sufficiency with smart truncation)
+        4. Layer 4: check_leverage_layer (Hard leverage limit verification)
         
         Args:
             order: OrderRequest object
@@ -336,7 +350,16 @@ class RiskManager:
         if margin_response.adjusted_volume < sizing_response.adjusted_volume:
             self._log_adjustment(order, margin_response)
             
-        final_approved_volume = margin_response.adjusted_volume
+        # Layer 4: Leverage Limit Check
+        leverage_response = self._check_leverage_layer(adjusted_order, margin_response.adjusted_volume)
+        if not leverage_response.approved:
+            self._log_rejection(order, leverage_response)
+            return leverage_response
+            
+        if leverage_response.adjusted_volume < margin_response.adjusted_volume:
+            self._log_adjustment(order, leverage_response)
+            
+        final_approved_volume = leverage_response.adjusted_volume
         
         # All layers passed
         
@@ -368,7 +391,7 @@ class RiskManager:
         return OrderResponse.approve(order.volume, f"Regime: ADX {order.adx:.2f} OK")
     
     def _calculate_risk_pos_layer(self, order: OrderRequest) -> OrderResponse:
-        """Layer 2: Sovereign Sizing based on DNA's risk_target_pct and max_position_size."""
+        """Layer 2: Sovereign Sizing aligned mathematically with stop-loss specifications."""
         if order.atr is None or pd.isna(order.atr) or order.atr <= 0:
             return OrderResponse.reject(
                 reason=f"Position Sizing: Invalid ATR ({order.atr})",
@@ -376,25 +399,30 @@ class RiskManager:
             )
         
         # Calculate raw risk amount
-        risk_amount = self.state.equity * (self.config.risk_target_pct / 100.0)
-        volatility_value = order.atr * self.config.multiplier
+        risk_per_trade = self.config.risk_target_pct / 100.0
+        sizing_equity = min(self.config.initial_capital, self.state.equity)
+        risk_amount = sizing_equity * risk_per_trade
+        
+        # Risk distance hierarchy
+        if self.config.sl_pct > 0.0 and order.price > 0.0:
+            # Fixed percentage stop loss: align risk distance to sl_pct
+            risk_distance = order.price * (self.config.sl_pct / 100.0)
+        else:
+            # Fallback to standard 2 * ATR
+            risk_distance = order.atr * 2.0
+            
+        volatility_value = risk_distance * self.config.multiplier
         
         if volatility_value <= 0:
             return OrderResponse.reject(reason="Invalid volatility mapping")
             
         target_lots = int(risk_amount / volatility_value)
         
-        # Absolute Veto: Max Position Size
-        if target_lots > self.config.max_position_size:
-            adjusted_vol = min(self.config.max_position_size, order.volume)
-            return OrderResponse.adjust(
-                original_volume=order.volume,
-                adjusted_volume=adjusted_vol,
-                reason=f"Position Sizing: Target {target_lots} exceeds DNA max ({self.config.max_position_size})"
-            )
-            
+        # Apply DNA max bounds
+        final_lots = min(max(target_lots, 1), self.config.max_position_size)
+        
         # Ensure we don't exceed the requested volume either
-        final_lots = min(target_lots, order.volume)
+        final_lots = min(final_lots, order.volume)
         if final_lots == 0:
             return OrderResponse.reject(reason="Position Sizing: Zero lots calculated")
             
@@ -450,6 +478,49 @@ class RiskManager:
             f"Margin Verified (closing: {closing_lots}, new: {new_lots}, required: {required_margin:.2f})",
             details={'required_margin': required_margin, 'freed_margin': freed_margin, 'new_lots': new_lots}
         )
+
+    def _check_leverage_layer(self, order: OrderRequest, approved_volume: int) -> OrderResponse:
+        """Layer 4: Hard Leverage Limit Interception & Smart Truncation."""
+        order_sign = 1 if order.direction_str == 'LONG' else -1
+        curr_pos = self.state.current_pos
+        
+        # Calculate projected net position
+        projected_pos = curr_pos + (approved_volume * order_sign)
+        projected_margin_occupied = abs(projected_pos) * self.config.initial_margin
+        
+        # If position size is decreasing or reversing to a smaller absolute size, approve immediately
+        if abs(projected_pos) <= abs(curr_pos):
+            return OrderResponse.approve(approved_volume, "Leverage: Position reduction approved")
+            
+        # Calculate leverage: margin occupied / equity
+        projected_leverage = projected_margin_occupied / self.state.equity if self.state.equity > 0 else 0.0
+        
+        if projected_leverage > self.config.leverage_limit:
+            # Smart Truncation to fit leverage limit
+            if self.config.initial_margin > 0:
+                max_allowed_pos = int((self.config.leverage_limit * self.state.equity) // self.config.initial_margin)
+            else:
+                max_allowed_pos = approved_volume
+                
+            # Max additional volume we can add in this direction
+            allowed_additional = max(0, max_allowed_pos - abs(curr_pos))
+            
+            if allowed_additional == 0:
+                return OrderResponse.reject(
+                    reason=f"Leverage Breach: Projected leverage {projected_leverage:.2f}x exceeds limit {self.config.leverage_limit:.2f}x (Zero additional volume allowed)"
+                )
+            elif allowed_additional < approved_volume:
+                return OrderResponse.adjust(
+                    original_volume=approved_volume,
+                    adjusted_volume=allowed_additional,
+                    reason=f"Leverage Breach Prevention: Truncated to fit {self.config.leverage_limit:.2f}x leverage limit"
+                )
+                
+            return OrderResponse.reject(
+                reason=f"Leverage Breach: Projected leverage {projected_leverage:.2f}x exceeds limit {self.config.leverage_limit:.2f}x"
+            )
+            
+        return OrderResponse.approve(approved_volume, "Leverage Check Passed")
     
     def _log_rejection(self, order: OrderRequest, response: OrderResponse):
         """Log rejected order to audit trail."""

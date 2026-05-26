@@ -246,8 +246,8 @@ class VectorizedBacktest:
         """Calculate PnL with optional stop loss."""
         # Execution & PnL Logic
         if execution_mode == 'Next Open':
-            df['price_change'] = df['open'].diff()
-            df['pos'] = df['pos_raw'].shift(2).fillna(0)
+            df['price_change'] = df['open'].shift(-1) - df['open']
+            df['pos'] = df['pos_raw'].shift(1).fillna(0)
             df['exec_price'] = df['open']
         else:
             df['price_change'] = df['close'].diff()
@@ -279,7 +279,7 @@ class VectorizedBacktest:
         
         # 2. Get entry prices (aligned to correct entry bar price)
         if execution_mode == 'Next Open':
-            df['entry_price'] = df['open'].shift(1)
+            df['entry_price'] = df['open']
         else:
             df['entry_price'] = df['close'].shift(1)
         
@@ -326,14 +326,14 @@ class VectorizedBacktest:
         first_bar_mask = (df['pos'] != 0) & position_changed
         
         if execution_mode == 'Next Open':
-            standard_ref = df['open'].shift(1)
+            standard_ref = df['open']
         else:
             standard_ref = df['close'].shift(1)
             
         df['ref_price'] = np.where(first_bar_mask, df['entry_price'], standard_ref)
         
         # 8. Calculate standard and stop PnL
-        current_price = df['open'] if execution_mode == 'Next Open' else df['close']
+        current_price = df['open'].shift(-1) if execution_mode == 'Next Open' else df['close']
         df['normal_pnl'] = (current_price - df['ref_price']) * multiplier * df['pos']
         df['sl_pnl'] = (df['sl_prices'] - df['ref_price']) * multiplier * df['pos']
         

@@ -44,7 +44,7 @@ def test_vectorized_lookahead_bias_elimination():
 
     # 2. Next Open Mode Verification
     df_open = df.copy()
-    df_open['pos'] = [0, 0, 0, 1, 1]  # Next Open 模式下 T+2 开始显示持仓
+    df_open['pos'] = [0, 0, 1, 1, 1]  # Next Open 模式下 T+1 开始显示持仓
     
     res_open = engine._apply_stop_loss(
         df=df_open,
@@ -53,14 +53,14 @@ def test_vectorized_lookahead_bias_elimination():
         sl_pct=2.0  # 止损线 102.0 * 0.98 = 99.96
     )
     
-    # 01-04 是持仓第一天，实际进场开盘价必须为 01-03 的开盘价 102.0
-    assert res_open.loc[dates[3], 'entry_price'] == 102.0, \
-        f"Next Open entry price error: expected 102.0, got {res_open.loc[dates[3], 'entry_price']}"
+    # 01-03 是持仓第一天，实际进场开盘价必须为 01-03 的开盘价 102.0
+    assert res_open.loc[dates[2], 'entry_price'] == 102.0, \
+        f"Next Open entry price error: expected 102.0, got {res_open.loc[dates[2], 'entry_price']}"
         
-    # 01-04 的首日标准持仓收益 (open[3] - entry_price) * mult * pos = (108 - 102) * 25 * 1 = 150.0
+    # 01-03 的首日标准持仓收益 (open[3] - entry_price) * mult * pos = (108 - 102) * 25 * 1 = 150.0
     # 它不应该被抹平为 0
-    assert res_open.loc[dates[3], 'normal_pnl'] == 150.0, \
-        f"Next Open first bar PnL error: expected 150.0, got {res_open.loc[dates[3], 'normal_pnl']}"
+    assert res_open.loc[dates[2], 'normal_pnl'] == 150.0, \
+        f"Next Open first bar PnL error: expected 150.0, got {res_open.loc[dates[2], 'normal_pnl']}"
 
 
 def test_event_driven_short_position_stop_loss():
