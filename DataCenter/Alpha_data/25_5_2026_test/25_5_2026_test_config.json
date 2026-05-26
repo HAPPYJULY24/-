@@ -40,17 +40,17 @@
             "max_lots": 20
         },
         "metrics": {
-            "Net Profit": 11283.01507998243,
-            "Total Net Profit": 11283.01507998243,
-            "Profit Factor": 1.09,
+            "Net Profit": 151.6570469022654,
+            "Total Net Profit": 151.6570469022654,
+            "Profit Factor": 1.0,
             "Win Rate": 45.31,
             "Win Rate (%)": 45.31,
-            "Max Drawdown": 24.3,
-            "Max Drawdown (%)": 24.3,
-            "Recovery Factor": 0.35,
+            "Max Drawdown": 27.8,
+            "Max Drawdown (%)": 27.8,
+            "Recovery Factor": 0.0,
             "Max DD Duration": 21.0,
-            "Sharpe Ratio": 1.5,
-            "Calmar Ratio": 11.92,
+            "Sharpe Ratio": 0.62,
+            "Calmar Ratio": 0.13,
             "Total Trades": 128,
             "Initial Capital": 100000.0
         }

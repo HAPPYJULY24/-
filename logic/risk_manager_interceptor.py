@@ -486,19 +486,20 @@ class RiskManager:
         
         # Calculate projected net position
         projected_pos = curr_pos + (approved_volume * order_sign)
-        projected_margin_occupied = abs(projected_pos) * self.config.initial_margin
         
         # If position size is decreasing or reversing to a smaller absolute size, approve immediately
         if abs(projected_pos) <= abs(curr_pos):
             return OrderResponse.approve(approved_volume, "Leverage: Position reduction approved")
             
-        # Calculate leverage: margin occupied / equity
-        projected_leverage = projected_margin_occupied / self.state.equity if self.state.equity > 0 else 0.0
+        # Calculate Real Notional Leverage: Notional Exposure / Equity
+        # Notional Exposure = abs(Projected Pos) * Entry Price * Multiplier
+        projected_notional_exposure = abs(projected_pos) * order.price * self.config.multiplier
+        projected_leverage = projected_notional_exposure / self.state.equity if self.state.equity > 0 else 0.0
         
         if projected_leverage > self.config.leverage_limit:
-            # Smart Truncation to fit leverage limit
-            if self.config.initial_margin > 0:
-                max_allowed_pos = int((self.config.leverage_limit * self.state.equity) // self.config.initial_margin)
+            # Smart Truncation to fit leverage limit using price and multiplier
+            if order.price > 0 and self.config.multiplier > 0:
+                max_allowed_pos = int((self.config.leverage_limit * self.state.equity) // (order.price * self.config.multiplier))
             else:
                 max_allowed_pos = approved_volume
                 

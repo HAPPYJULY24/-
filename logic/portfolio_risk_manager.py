@@ -86,13 +86,13 @@ class PortfolioRiskManager:
         Calculate total portfolio risk.
         
         Returns:
-            Portfolio risk as fraction of NAV
+             Portfolio risk as fraction of NAV (Margin Utilization)
         """
         if self.nav <= 0:
             return 0.0
         
-        total_var = sum(pos.unrealized_pnl for pos in self.positions.values())
-        return abs(total_var) / self.nav
+        total_margin = sum(pos.margin_used for pos in self.positions.values())
+        return total_margin / self.nav
     
     def check_position_limit(
         self, 

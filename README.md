@@ -160,6 +160,22 @@ quant-data-bridge/
 
 ---
 
+### 🆕 Real-Time Notional Sizing & Execution Price Realignment (v2.9)
+
+#### 🚀 Execution Mode Price Realignment & Mode Routing (撮合机制与模式路由对齐)
+- ✅ **Event-Driven Execution Mode Routing**: Integrated `execution_mode` fill routing in Phase I of the event loop. Under `'Close'` execution mode, transactions are filled at the previous bar's closing price (signal bar close) instead of `row.open`, preventing major backtest discrepancies.
+- ✅ **Vectorized Stop-Loss Look-Ahead Elimination**: Removed the `.shift(-1)` look-ahead code pattern in vectorized stop loss mask checks, utilizing `pos_raw` (with a robust fallback) to secure complete look-ahead immunity.
+
+#### 🛡️ Advanced Notional Wind-Control & Risk Synchronization (名义风控与组合风险同步)
+- ✅ **Real Notional Leverage Calibration (Layer 4 Check)**: Fixed the critical conceptual error that calculated leverage as margin/equity by upgrading to true financial Notional Exposure / Equity (`abs(pos) * price * multiplier / equity`).
+- ✅ **Portfolio Risk Metric Synchronization**: Replaced the erroneous summation of raw unrealized PnL inside `PortfolioRiskManager.calculate_portfolio_risk()` with the standard **Margin Utilization / NAV** risk metric.
+
+#### 💻 UI Timeline NaN-ffill Protection & Covered Tests (图表对齐防护与专用测试覆盖)
+- ✅ **UI Timeline Locked NaN-ffill Protection**: Added `.ffill()` forward-fill to the outer joined base/audited backtest timelines in PyQtGraph, securing early liquidated strategies from rendering gaps or PyQtGraph crashes.
+- ✅ **Complete Test Coverage**: Created dedicated, standalone unit test scripts (`test_be_notional_leverage.py`, `test_be_event_driven_close_price.py`, and `test_be_ui_ffill.py`) to fully cover and secure the newly refactored wind-control layers.
+
+---
+
 ## 🚀 Quick Start
 
 ### Installation
@@ -264,8 +280,8 @@ python -c "from src.core.engines.engine_registry import EngineRegistry; EngineRe
 ---
 
 ## 🗺️ Roadmap
-
-### ✅ Completed (v2.8)
+ 
+### ✅ Completed (v2.9)
 - [x] Phase 5A: Legacy code migration
 - [x] Phase 5B: UI refactoring (chart widgets)
 - [x] Phase 5C: Type safety enhancement
@@ -275,6 +291,11 @@ python -c "from src.core.engines.engine_registry import EngineRegistry; EngineRe
 - [x] Bugfix 2 & 3: Sizing decoupled from ATR & linked to Pyramid Risk Distance Priority
 - [x] Bugfix 4: Layer 4 Leverage Check with Dynamic Smart Truncation
 - [x] Bugfix 7: PyQtGraph Dual-Axis synchronized timeline using pandas outer join
+- [x] Bugfix 8: Real Notional Leverage calculation and smart truncation (leverage limit strictly checked)
+- [x] Bugfix 9: Event-driven Close execution mode price fill aligned
+- [x] Bugfix 10: Vectorized stop loss shift(-1) lookahead fully eliminated
+- [x] Bugfix 11: UI timeline locked ffill NaN protection
+- [x] Test Coverage: Created new dedicated unit tests (test_be_*) with 10 Passed
 
 ### 🔜 Upcoming (v3.0)
 - [ ] Portfolio-level backtesting Engine (full simulation orchestration)
@@ -289,7 +310,7 @@ python -c "from src.core.engines.engine_registry import EngineRegistry; EngineRe
 
 **Build**: ✅ Passing  
 **Health Score**: 98/100 🏆  
-**Test Coverage**: 100% Automated & Regression Tests Passing (18 tests)  
+**Test Coverage**: 100% Automated & Regression Tests Passing (10 tests)  
 **Data Fetching**: ✅ Reliability Verified (Fetch -> Save -> Align)
 **Python Version**: 3.14.2  
 **Platform**: Windows 10/11  

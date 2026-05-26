@@ -164,7 +164,7 @@ def test_double_sided_friction_costs():
         initial_margin=5000.0,
         allow_lunch=True,
         allow_overnight=True,
-        execution_mode='Close',
+        execution_mode='Next Open',
         risk_params={'max_lots': 2}
     )
     

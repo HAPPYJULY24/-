@@ -79,7 +79,7 @@ class RiskDashboardCharts(QWidget):
             left_index=True,
             right_index=True,
             how='outer'
-        ).sort_index()
+        ).sort_index().ffill()
         
         # 2. Extract synchronized time coordinates
         idx = aligned.index

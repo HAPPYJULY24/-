@@ -166,9 +166,14 @@ class EventDrivenBacktest:
             
             # Step I-1: Execute the pending order at the OPEN of the current bar
             if pending_action != 0:
+                if execution_mode == 'Close':
+                    fill_price = df.iloc[i-1]['close'] if i > 0 else row.open
+                else:
+                    fill_price = row.open
+
                 if pending_action == 2:  # Close command
                     if current_position is not None and current_position.lots > 0:
-                        exit_price = row.open  # LOCK: execution price is strictly current bar's open
+                        exit_price = fill_price
                         lots_closed = current_position.lots
                         dir_val = current_position.direction.value
                         direction_mult = 1 if dir_val == "LONG" or dir_val == 1 else -1
@@ -192,7 +197,7 @@ class EventDrivenBacktest:
                         net_pnl_arr[i] = pnl_net  # FIX: was never written — now recorded immediately
                         current_position = None
                         
-                        self._emit_log(f"🔄 [{row.Index}] PHASE I — T+1 Close at OPEN {exit_price:.2f} | Net PnL={pnl_net:.2f}")
+                        self._emit_log(f"🔄 [{row.Index}] PHASE I — T+1 Close at {exit_price:.2f} | Net PnL={pnl_net:.2f}")
                         executed_this_bar = True
                         just_closed = True
                         
@@ -209,7 +214,7 @@ class EventDrivenBacktest:
                             volume=intent_volume,
                             direction=pending_action,
                             order_type='MARKET',
-                            price=row.open,  # LOCK: entry strictly at current bar's open
+                            price=fill_price,
                             timestamp=row.Index,
                             atr=atr_val,
                             adx=adx_val
@@ -223,13 +228,13 @@ class EventDrivenBacktest:
                                     symbol=asset_symbol,
                                     direction=TradeDirection.LONG if pending_action == 1 else TradeDirection.SHORT,
                                     lots=lots,
-                                    avg_entry_price=row.open,
+                                    avg_entry_price=fill_price,
                                     multiplier=multiplier,
                                     initial_margin_per_lot=initial_margin,
                                     entry_time=row.Index
                                 )
                                 entered_this_bar_index = i
-                                self._emit_log(f"✅ [{row.Index}] PHASE I — T+1 Entry: {order_request.direction_str} x{lots} at OPEN {row.open:.2f}")
+                                self._emit_log(f"✅ [{row.Index}] PHASE I — T+1 Entry: {order_request.direction_str} x{lots} at {fill_price:.2f}")
                                 executed_this_bar = True
                                 
                                 # Deduct entry friction (single-side cost)
@@ -243,13 +248,13 @@ class EventDrivenBacktest:
                                     symbol=asset_symbol,
                                     direction=TradeDirection.LONG if pending_action == 1 else TradeDirection.SHORT,
                                     lots=lots,
-                                    avg_entry_price=row.open,
+                                    avg_entry_price=fill_price,
                                     multiplier=multiplier,
                                     initial_margin_per_lot=initial_margin,
                                     entry_time=row.Index
                                 )
                                 entered_this_bar_index = i
-                                self._emit_log(f"✅ [{row.Index}] PHASE I — T+1 Entry (Legacy): {pending_action} x{lots} at OPEN {row.open:.2f}")
+                                self._emit_log(f"✅ [{row.Index}] PHASE I — T+1 Entry (Legacy): {pending_action} x{lots} at {fill_price:.2f}")
                                 executed_this_bar = True
                                 
                                 # Deduct entry friction (single-side cost)

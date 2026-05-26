@@ -294,7 +294,8 @@ class VectorizedBacktest:
         # 4. Identify Signal Generation Bar (Signal Bar)
         # In Close mode, T is signal bar (pos[T]=0, pos[T+1]!=0)
         if execution_mode == 'Close':
-            signal_bar_mask = (df['pos'] == 0) & (df['pos'].shift(-1).fillna(0) != 0)
+            pos_raw = df['pos_raw'] if 'pos_raw' in df.columns else df['pos'].shift(-1).fillna(0)
+            signal_bar_mask = (df['pos'] == 0) & (pos_raw.fillna(0) != 0)
         else:
             signal_bar_mask = pd.Series(False, index=df.index)
         
