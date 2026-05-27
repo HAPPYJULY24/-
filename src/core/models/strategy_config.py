@@ -35,6 +35,11 @@ class BacktestProfile:
     metrics: Optional[Dict[str, float]] = None
 
 @dataclass
+class AlphaProfile:
+    metrics: Optional[Dict[str, Any]] = field(default_factory=dict)
+    professional_metrics: Optional[Dict[str, Any]] = field(default_factory=dict)
+
+@dataclass
 class RiskAudit:
     status: str = "PENDING"
     details: Optional[Dict[str, Any]] = None
@@ -45,6 +50,7 @@ class StrategyConfig:
     metadata: StrategyMetadata
     environment_config: EnvironmentConfig
     alpha_pipeline: AlphaPipelineConfig
+    alpha_profile: AlphaProfile = field(default_factory=AlphaProfile)
     backtest_profile: BacktestProfile = field(default_factory=BacktestProfile)
     risk_audit: RiskAudit = field(default_factory=RiskAudit)
 
@@ -61,6 +67,7 @@ class StrategyConfig:
             metadata=StrategyMetadata(**data.get("metadata", {})),
             environment_config=EnvironmentConfig(**data.get("environment_config", {})),
             alpha_pipeline=AlphaPipelineConfig(**data.get("alpha_pipeline", {})),
+            alpha_profile=AlphaProfile(**data.get("alpha_profile", {})),
             backtest_profile=BacktestProfile(**data.get("backtest_profile", {})),
             risk_audit=RiskAudit(**data.get("risk_audit", {}))
         )

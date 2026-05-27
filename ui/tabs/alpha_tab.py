@@ -1188,8 +1188,36 @@ class AlphaTab(QWidget):
             auto_drop = self.auto_drop_chk.isChecked()
             
             # 3. 构造接力棒 JSON DRAFT 载体
-            from src.core.models.strategy_config import StrategyConfig, StrategyMetadata, EnvironmentConfig, AlphaPipelineConfig
-            
+            from src.core.models.strategy_config import StrategyConfig, StrategyMetadata, EnvironmentConfig, AlphaPipelineConfig, AlphaProfile
+
+            def clean_dict_numpy(d):
+                cleaned = {}
+                if not isinstance(d, dict):
+                    return cleaned
+                for k, v in d.items():
+                    if pd.isna(v) or v is None:
+                        cleaned[k] = None
+                    elif isinstance(v, (np.integer, int)):
+                        cleaned[k] = int(v)
+                    elif isinstance(v, (np.floating, float)):
+                        if np.isinf(v):
+                            cleaned[k] = None
+                        else:
+                            cleaned[k] = float(v)
+                    elif isinstance(v, str):
+                        cleaned[k] = v
+                    elif isinstance(v, (list, tuple)):
+                        cleaned[k] = [x.item() if hasattr(x, 'item') else x for x in v]
+                    elif hasattr(v, 'item'):  # Handle scalar numpy types
+                        val = v.item()
+                        if pd.isna(val):
+                            cleaned[k] = None
+                        else:
+                            cleaned[k] = val
+                    else:
+                        cleaned[k] = str(v)
+                return cleaned
+
             stg_config = StrategyConfig(
                 metadata=StrategyMetadata(
                     strategy_id=stg_id,
@@ -1207,15 +1235,19 @@ class AlphaTab(QWidget):
                     risk_factors=risk_factors,
                     ridge_alpha=ridge_alpha,
                     auto_drop_zero_vol=auto_drop
+                ),
+                alpha_profile=AlphaProfile(
+                    metrics=clean_dict_numpy(self.current_result.get('metrics', {})),
+                    professional_metrics=clean_dict_numpy(self.current_result.get('professional_metrics', {}))
                 )
             )
             
             paths_created = []
             
-            # Save to Data Center (which physically goes to DataCenter/Alpha_data)
+            # Save to Data Center (which physically goes to datacenter/Alpha_data/{folder_name})
             dc_base = None
             if save_mode in ['data_center', 'both']:
-                dc_base = Path("DataCenter/Alpha_data") / folder_name
+                dc_base = Path("datacenter/Alpha_data") / folder_name
                 dc_base.mkdir(parents=True, exist_ok=True)
                 AlphaEngine.write_signal_export_parquet(save_df, dc_base / parquet_filename, export_metadata)
                 stg_config.to_json(str(dc_base / json_filename))

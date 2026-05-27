@@ -108,6 +108,8 @@ class EventDrivenBacktest:
         # Shift ATR so that when checking stops or sizing during bar T, 
         # we only use volatility information known at the end of bar T-1.
         df['atr'] = df['atr'].shift(1).fillna(0)
+        if 'adx' in df.columns:
+            df['adx'] = df['adx'].shift(1).fillna(0)
             
         # Signal Processing: The `signal` column MUST exist prior to calling this engine.
         # Fallback to 0 if not natively available
@@ -163,6 +165,21 @@ class EventDrivenBacktest:
             exit_price = None
             entry_price = None
             executed_this_bar = False
+            
+            # Step I-0.5: Open-to-Market (MtM) Sync to prevent stale risk metrics on Overnight Gaps
+            if current_position is not None and current_position.lots > 0:
+                floating_pnl_open = current_position.calculate_pnl(row.open)
+                open_equity = current_balance + floating_pnl_open
+                direction_sign = 1 if current_position.direction == TradeDirection.LONG else -1
+                current_pos_signed = current_position.lots * direction_sign
+                current_used_margin = current_position.margin_used
+            else:
+                open_equity = current_balance
+                current_pos_signed = 0
+                current_used_margin = 0.0
+            
+            if hasattr(rm, 'sync_account_state'):
+                rm.sync_account_state(current_balance, open_equity, current_pos_signed, current_used_margin, current_date=row.Index)
             
             # Step I-1: Execute the pending order at the OPEN of the current bar
             if pending_action != 0:

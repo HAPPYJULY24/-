@@ -24,6 +24,21 @@ Quant Data Bridge is a professional quantitative trading platform that integrate
 - **Timezone Standardization**: Asia/Kuala_Lumpur default
 - **Format Support**: Parquet (optimized) and CSV export
 
+### 📁 Data Center Folder Structure (后端文件路径硬性条件)
+所有数据如果点击了保存在数据中心，一律将会保持在 `/datacenter` 文件夹：
+
+* **数据抓取** - `/datacenter/RawData`
+  * 马股 - `/datacenter/RawData/MY_stock`
+  * 美股 - `/datacenter/RawData/US_stock`
+  * 国际期货 - `/datacenter/RawData/IF`
+  * Bursa期货 - `/datacenter/RawData/BF`
+  * 加密货币 - `/datacenter/RawData/Crypto`
+  * 货币 - `/datacenter/RawData/currency`
+* **数据对齐** - `/datacenter/RawData/alignment`
+* **因子挖掘业务** - `/datacenter/Alpha_data/`
+* **回测业务** - `/datacenter/Backtest_data/`
+* **风控业务** - `/datacenter/Risk_control_data/`
+
 ### 🔬 Alpha Factor Lab (v3.0)
 - **Expression-Based Factors**: Python syntax for flexible factor creation
 - **Preprocessing Pipeline**: 3-Sigma, MAD, Quantile winsorization
@@ -176,6 +191,21 @@ quant-data-bridge/
 
 ---
 
+### 🆕 Interceptor Mode High-Precision Security Patches (v2.9.5)
+
+#### 🚀 Robust Multi-Layer Validation & Sizing Security (多层验证与仓位控制安全)
+- ✅ **NaN-Swallowing Order Bypass Prevention (VULN-01)**: Introduced explicit `pd.isna` and `np.isnan` check guards inside ADX Regime, Margin, and Leverage layers to block invalid or corrupted NaN parameters from bypassing critical risk checks.
+- ✅ **Zero Price Sizing Protection**: Integrated positive price check logic inside sizing calculations to prevent divide-by-zero errors or zero price bypass during volatile market anomalies.
+
+#### 🛡️ Sovereign State Sync & Day-Transition Decoupling (主权账本与回撤基准解耦)
+- ✅ **Integer Index Daily Reset Resolution (VULN-02)**: Decoupled day transition monitoring from datetime-specific string slicing, ensuring non-datetime datasets (such as integer-indexed backtests) do not trigger daily baseline equity reset on every bar, successfully restoring daily drawdown defense (20% cap).
+- ✅ **State Mutation Overwrite Protection (VULN-03)**: Added early return validation inside `sync_account_state` to freeze and shield the original liquidation trigger reason (e.g. Margin Call) from being overwritten by subsequent drawdown assessments.
+
+#### 💻 High-Precision Regression Tests (高精度安全测试覆盖)
+- ✅ **100% Passing Multi-Scenario Unit Tests**: Created `test_audit_new_vulnerabilities.py` covering NaN checks, integer index baseline checks, and liquidation reason preservation. All 33 automated tests are fully passing (100% test pass rate).
+
+---
+
 ## 🚀 Quick Start
 
 ### Installation
@@ -281,7 +311,7 @@ python -c "from src.core.engines.engine_registry import EngineRegistry; EngineRe
 
 ## 🗺️ Roadmap
  
-### ✅ Completed (v2.9)
+### ✅ Completed (v2.9.5)
 - [x] Phase 5A: Legacy code migration
 - [x] Phase 5B: UI refactoring (chart widgets)
 - [x] Phase 5C: Type safety enhancement
@@ -295,7 +325,10 @@ python -c "from src.core.engines.engine_registry import EngineRegistry; EngineRe
 - [x] Bugfix 9: Event-driven Close execution mode price fill aligned
 - [x] Bugfix 10: Vectorized stop loss shift(-1) lookahead fully eliminated
 - [x] Bugfix 11: UI timeline locked ffill NaN protection
-- [x] Test Coverage: Created new dedicated unit tests (test_be_*) with 10 Passed
+- [x] Interceptor Mode VULN-01: NaN-Swallowing Order Bypass Prevention across all layers
+- [x] Interceptor Mode VULN-02: Integer Index Daily Reset Resolution for non-datetime datasets
+- [x] Interceptor Mode VULN-03: State Mutation Overwrite Protection for original liquidation reason
+- [x] Test Coverage: Expanded automated regression test suite to 33 Passed tests (with dedicated test_audit_new_vulnerabilities)
 
 ### 🔜 Upcoming (v3.0)
 - [ ] Portfolio-level backtesting Engine (full simulation orchestration)
@@ -303,6 +336,7 @@ python -c "from src.core.engines.engine_registry import EngineRegistry; EngineRe
 - [ ] Advanced ML factor library
 - [ ] Cloud database integration
 - [ ] Web API for external systems
+- [ ] Live Trading Decoupling: Two-Phase Commit State Machine (Technical Debt archived)
 
 ---
 
@@ -310,7 +344,7 @@ python -c "from src.core.engines.engine_registry import EngineRegistry; EngineRe
 
 **Build**: ✅ Passing  
 **Health Score**: 98/100 🏆  
-**Test Coverage**: 100% Automated & Regression Tests Passing (10 tests)  
+**Test Coverage**: 100% Automated & Regression Tests Passing (33 tests)  
 **Data Fetching**: ✅ Reliability Verified (Fetch -> Save -> Align)
 **Python Version**: 3.14.2  
 **Platform**: Windows 10/11  

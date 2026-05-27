@@ -12,10 +12,11 @@ import pandas as pd
 class CacheManager:
     """缓存和临时文件管理器"""
     
-    STORE_DIR = "DataCenter/RawData"
+    STORE_DIR = "datacenter/RawData"
     EXPORTED_DIR = "exported_data"
-    BACKTESTS_DIR = "DataCenter/Backtest_data"
-    RISK_AUDITS_DIR = "DataCenter/Risk_control_data"
+    BACKTESTS_DIR = "datacenter/Backtest_data"
+    RISK_AUDITS_DIR = "datacenter/Risk_control_data"
+    ALPHA_DIR = "datacenter/Alpha_data"
     
     @staticmethod
     def get_master_db_info() -> Tuple[List[Dict], int, float]:
@@ -49,7 +50,7 @@ class CacheManager:
             
             # 提取类别 Category，通过判断路径组成部分
             category = "Unknown"
-            category_mapping = ["MYSTOCK", "US_Stock", "International_Futures_data", "Bursa_Futures_data", "CRYPTO_data", "Align_data"]
+            category_mapping = ["MY_stock", "US_stock", "IF", "BF", "Crypto", "currency", "alignment"]
             for part in p_file.parts:
                 if part in category_mapping:
                     category = part
@@ -74,7 +75,7 @@ class CacheManager:
                 name_without_ext = filename.replace('.parquet', '')
                 
                 # Check if this is an aligned dataset which has custom naming
-                if category == 'Align_data' or 'ALIGNED' in p_file.parts:
+                if category == 'alignment' or 'alignment' in p_file.parts or 'ALIGNED' in p_file.parts:
                     code = name_without_ext
                     timeframe = "Aligned"
                 else:
@@ -609,5 +610,13 @@ class CacheManager:
         """Return and auto-create the risk audit data directory."""
         from pathlib import Path
         p = Path(CacheManager.RISK_AUDITS_DIR)
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    @staticmethod
+    def get_alpha_storage_dir():
+        """Return and auto-create the alpha data directory."""
+        from pathlib import Path
+        p = Path(CacheManager.ALPHA_DIR)
         p.mkdir(parents=True, exist_ok=True)
         return p

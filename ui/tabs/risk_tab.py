@@ -45,7 +45,65 @@ class RiskWorker(QThread):
             df = pd.read_parquet(self.signal_path)
 
             with open(self.dna_path, 'r', encoding='utf-8') as f:
-                dna = json.load(f)
+                raw_dna = json.load(f)
+
+            import copy
+            dna = copy.deepcopy(raw_dna)
+            
+            if "backtest_profile" in dna and "settings" in dna["backtest_profile"]:
+                # Translate unified StrategyConfig to legacy format for in-memory execution compatibility
+                metadata = dna.get("metadata", {})
+                env_config = dna.get("environment_config", {})
+                alpha_pipeline = dna.get("alpha_pipeline", {})
+                backtest_profile = dna.get("backtest_profile", {})
+                settings = backtest_profile.get("settings", {}) or {}
+                dna = {
+                    "identification": {
+                        "strategy_id": metadata.get("strategy_id", "UNKNOWN"),
+                        "backtest_version": "v1.0-unified",
+                        "timestamp": metadata.get("created_at", "")
+                    },
+                    "environment": {
+                        "universe": [env_config.get("universe", "unknown")],
+                        "timeframe": env_config.get("timeframe", "unknown"),
+                        "initial_capital": float(settings.get("initial_capital", 100000.0)),
+                        "currency": "RM"
+                    },
+                    "alpha_configuration": {
+                        "factor_expression": alpha_pipeline.get("expression", ""),
+                        "preprocessing_params": {
+                            "winsorize_limit": 0.05,
+                            "neutralization": bool(alpha_pipeline.get("risk_factors")),
+                            "standardization": "z-score"
+                        }
+                    },
+                    "optimized_decision_parameters": {
+                        "entry_threshold": float(settings.get("upper_bound", 0.0)),
+                        "exit_threshold": float(settings.get("lower_bound", 0.0)),
+                        "rebalance_mode": "signal_driven",
+                        "order_type": "market",
+                        "execution_mode": settings.get("execution_mode", "Close")
+                    },
+                    "execution_constraints": {
+                        "allow_overnight": bool(settings.get("allow_overnight", True)),
+                        "allow_lunch": bool(settings.get("allow_lunch", True)),
+                        "adx_filter_enabled": bool(settings.get("use_adx_filter", False))
+                    },
+                    "friction_costs": {
+                        "multiplier": float(settings.get("multiplier", 25.0)),
+                        "commission_per_lot": float(settings.get("commission", 15.0)),
+                        "slippage_ticks": float(settings.get("slippage", 1.0))
+                    },
+                    "backtest_risk_settings": {
+                        "stop_loss_type": "Intra-bar SL" if float(settings.get("sl_pct", 0.0)) > 0 else "None",
+                        "stop_loss_value": float(settings.get("sl_pct", 0.0)),
+                        "take_profit_value": float(settings.get("tp_pct", 0.0)),
+                        "max_position_size": int(settings.get("max_lots", 20)),
+                        "leverage_limit": float(settings.get("leverage_limit", 10.0)),
+                        "initial_margin": float(settings.get("initial_margin", 5000.0)),
+                        "risk_target_pct": float(settings.get("risk_target", 1.0))
+                    }
+                }
 
             # ── Shared params from original DNA ─────────────────────
             upper_bound    = float(dna["optimized_decision_parameters"].get("entry_threshold", 0.0))
@@ -271,9 +329,17 @@ class RiskTab(QWidget):
         right_layout = QVBoxLayout(right_panel)
         right_layout.setContentsMargins(0, 0, 0, 0)
 
-        # Top bar: export button (right-aligned)
+        # Top bar: export buttons (right-aligned)
         top_bar = QHBoxLayout()
         top_bar.addStretch()
+        
+        self.report_btn = QPushButton("📋 Export End-to-End Report")
+        self.report_btn.setEnabled(False)
+        self.report_btn.setStyleSheet(
+            "background:#2E7D32; color:#B0BEC5; padding:4px 10px; border-radius:4px; font-weight:bold;")
+        self.report_btn.clicked.connect(self._export_complete_report)
+        top_bar.addWidget(self.report_btn)
+        
         self.export_btn = QPushButton("💾 Export Audit Log")
         self.export_btn.setEnabled(False)
         self.export_btn.setStyleSheet(
@@ -348,13 +414,20 @@ class RiskTab(QWidget):
 
     # ------------------------------------------------------------------
     def refresh_files(self):
-        storage_dir = CacheManager.get_backtest_storage_dir()
-        storage_dir.mkdir(parents=True, exist_ok=True)
-        folders = [f for f in storage_dir.iterdir()
-                   if f.is_dir() and list(f.glob("*.json"))]
+        backtest_dir = CacheManager.get_backtest_storage_dir()
+        
+        folders = []
+        if backtest_dir.exists():
+            folders.extend([f for f in backtest_dir.iterdir()
+                            if f.is_dir() and list(f.glob("*.json"))])
+                            
         self.folder_combo.clear()
         if folders:
-            self.folder_combo.addItems([f.name for f in folders])
+            seen = set()
+            for f in folders:
+                if f.name not in seen:
+                    seen.add(f.name)
+                    self.folder_combo.addItem(f.name, str(f))
         else:
             self.folder_combo.addItem("No DNA found in Data Center")
             self.run_btn.setEnabled(False)
@@ -367,8 +440,17 @@ class RiskTab(QWidget):
             self.run_btn.setEnabled(False)
             return
 
-        dc_path    = CacheManager.get_backtest_storage_dir() / folder_name
-        json_files = list(dc_path.glob("*.json"))
+        folder_path = self.folder_combo.currentData()
+        if folder_path:
+            dc_path = Path(folder_path)
+        else:
+            dc_path = CacheManager.get_backtest_storage_dir() / folder_name
+
+        json_files = list(dc_path.glob("config.json"))
+        if not json_files:
+            json_files = list(dc_path.glob("*_config.json"))
+        if not json_files:
+            json_files = list(dc_path.glob("*.json"))
 
         if not json_files:
             self.run_btn.setEnabled(False)
@@ -376,7 +458,138 @@ class RiskTab(QWidget):
 
         try:
             with open(json_files[0], 'r', encoding='utf-8') as f:
-                dna = json.load(f)
+                raw_dna = json.load(f)
+            
+            import copy
+            dna = copy.deepcopy(raw_dna)
+            
+            # Prioritize matching unified StrategyConfig schema
+            self._current_config = None
+            if "backtest_profile" in dna and "settings" in dna["backtest_profile"]:
+                # Save modern strategy config representation for E2E reports
+                self._current_config = copy.deepcopy(raw_dna)
+                
+                # Dynamic translation for Risk Tab UI pre-fills & displays
+                metadata = dna.get("metadata", {})
+                env_config = dna.get("environment_config", {})
+                alpha_pipeline = dna.get("alpha_pipeline", {})
+                backtest_profile = dna.get("backtest_profile", {})
+                settings = backtest_profile.get("settings", {}) or {}
+                dna = {
+                    "identification": {
+                        "strategy_id": metadata.get("strategy_id", "UNKNOWN"),
+                        "strategy_name": metadata.get("strategy_name", "UNKNOWN"),
+                        "status": metadata.get("status", "ALPHA_DRAFT"),
+                        "backtest_version": "v1.0-unified",
+                        "timestamp": metadata.get("created_at", "")
+                    },
+                    "environment": {
+                        "universe": [env_config.get("universe", "unknown")],
+                        "timeframe": env_config.get("timeframe", "unknown"),
+                        "initial_capital": float(settings.get("initial_capital", 100000.0)),
+                        "currency": "RM"
+                    },
+                    "alpha_configuration": {
+                        "factor_expression": alpha_pipeline.get("expression", ""),
+                        "preprocessing_params": {
+                            "winsorize_limit": 0.05,
+                            "neutralization": bool(alpha_pipeline.get("risk_factors")),
+                            "standardization": "z-score"
+                        }
+                    },
+                    "optimized_decision_parameters": {
+                        "entry_threshold": float(settings.get("upper_bound", 0.0)),
+                        "exit_threshold": float(settings.get("lower_bound", 0.0)),
+                        "rebalance_mode": "signal_driven",
+                        "order_type": "market",
+                        "execution_mode": settings.get("execution_mode", "Close")
+                    },
+                    "execution_constraints": {
+                        "allow_overnight": bool(settings.get("allow_overnight", True)),
+                        "allow_lunch": bool(settings.get("allow_lunch", True)),
+                        "adx_filter_enabled": bool(settings.get("use_adx_filter", False))
+                    },
+                    "friction_costs": {
+                        "multiplier": float(settings.get("multiplier", 25.0)),
+                        "commission_per_lot": float(settings.get("commission", 15.0)),
+                        "slippage_ticks": float(settings.get("slippage", 1.0))
+                    },
+                    "backtest_risk_settings": {
+                        "stop_loss_type": "Intra-bar SL" if float(settings.get("sl_pct", 0.0)) > 0 else "None",
+                        "stop_loss_value": float(settings.get("sl_pct", 0.0)),
+                        "take_profit_value": float(settings.get("tp_pct", 0.0)),
+                        "max_position_size": int(settings.get("max_lots", 20)),
+                        "leverage_limit": float(settings.get("leverage_limit", 10.0)),
+                        "initial_margin": float(settings.get("initial_margin", 5000.0)),
+                        "risk_target_pct": float(settings.get("risk_target", 1.0))
+                    }
+                }
+            else:
+                # Dynamically translate legacy DNA to modern StrategyConfig in-memory for E2E reports!
+                import numpy as np
+                import pandas as pd
+                
+                stg_id = dna.get("identification", {}).get("strategy_id", "UNKNOWN")
+                stg_name = dna.get("identification", {}).get("strategy_name", folder_name)
+                env = dna.get("environment", {})
+                alpha_cfg = dna.get("alpha_configuration", {})
+                op = dna.get("optimized_decision_parameters", {})
+                fc = dna.get("friction_costs", {})
+                brs = dna.get("backtest_risk_settings", {})
+                ec = dna.get("execution_constraints", {})
+                
+                self._current_config = {
+                    "metadata": {
+                        "strategy_id": stg_id,
+                        "strategy_name": stg_name,
+                        "status": dna.get("identification", {}).get("status", "BACKTESTED"),
+                        "created_at": dna.get("identification", {}).get("timestamp", ""),
+                        "metrics_schema_version": "alpha_kpi_v2"
+                    },
+                    "environment_config": {
+                        "universe": env.get("universe", "unknown"),
+                        "timeframe": env.get("timeframe", "unknown")
+                    },
+                    "alpha_pipeline": {
+                        "expression": alpha_cfg.get("factor_expression", ""),
+                        "winsor_method": alpha_cfg.get("preprocessing_params", {}).get("winsorize_limit", 0.05),
+                        "quantile_lb": 0.01,
+                        "quantile_ub": 0.99,
+                        "risk_factors": [],
+                        "ridge_alpha": 1.0,
+                        "auto_drop_zero_vol": False
+                    },
+                    "alpha_profile": {
+                        "metrics": {},
+                        "professional_metrics": {}
+                    },
+                    "backtest_profile": {
+                        "settings": {
+                            "multiplier": float(fc.get("multiplier", 25.0)),
+                            "commission": float(fc.get("commission_per_lot", 15.0)),
+                            "slippage": float(fc.get("slippage_ticks", 1.0)),
+                            "strategy": alpha_cfg.get("factor_expression", ""),
+                            "initial_capital": float(env.get("initial_capital", 100000.0)),
+                            "upper_bound": float(op.get("entry_threshold", 0.0)),
+                            "lower_bound": float(op.get("exit_threshold", 0.0)),
+                            "initial_margin": float(brs.get("initial_margin", 5000.0)),
+                            "allow_overnight": bool(ec.get("allow_overnight", True)),
+                            "allow_lunch": bool(ec.get("allow_lunch", True)),
+                            "execution_mode": op.get("execution_mode", "Close"),
+                            "risk_target": float(brs.get("risk_target_pct", 1.0)),
+                            "sl_pct": float(brs.get("stop_loss_value", 0.0)),
+                            "tp_pct": float(brs.get("take_profit_value", 0.0)),
+                            "use_adx_filter": bool(ec.get("adx_filter_enabled", False)),
+                            "max_lots": int(brs.get("max_position_size", 20))
+                        },
+                        "metrics": {}
+                    },
+                    "risk_audit": {
+                        "status": "PENDING",
+                        "details": None
+                    }
+                }
+                
             self._current_dna = dna
 
             # ── Read-only summary ──────────────────────────────
@@ -431,8 +644,18 @@ class RiskTab(QWidget):
         if not folder_name or folder_name == "No DNA found in Data Center":
             return
 
-        dc_path    = CacheManager.get_backtest_storage_dir() / folder_name
-        json_files = list(dc_path.glob("*.json"))
+        folder_path = self.folder_combo.currentData()
+        if folder_path:
+            dc_path = Path(folder_path)
+        else:
+            dc_path = CacheManager.get_backtest_storage_dir() / folder_name
+
+        json_files = list(dc_path.glob("config.json"))
+        if not json_files:
+            json_files = list(dc_path.glob("*_config.json"))
+        if not json_files:
+            json_files = list(dc_path.glob("*.json"))
+
         if not json_files:
             QMessageBox.critical(self, "Error", "No DNA json found.")
             return
@@ -440,27 +663,71 @@ class RiskTab(QWidget):
         dna_path = str(json_files[0])
 
         # Resolve signal parquet
-        dna      = self._current_dna or {}
-        raw_u    = dna.get("environment", {}).get("universe", "")
+        dna = self._current_dna or {}
+        raw_u = dna.get("environment", {}).get("universe", "")
         if isinstance(raw_u, list):
             raw_u = ", ".join(raw_u)
-        universe  = raw_u.strip("[]").strip()
+        universe = raw_u.strip("[]").strip()
         timeframe = dna.get("environment", {}).get("timeframe", "unknown")
 
-        signals_dir    = Path("DataCenter/Alpha_data")
+        # Clean universe name by stripping known suffixes like " (Aligned)" or similar
+        universe_clean = universe
+        for suffix in [" (Aligned)", " (aligned)", " (ALIGNED)"]:
+            if universe_clean.endswith(suffix):
+                universe_clean = universe_clean[:-len(suffix)]
+
+        signals_dir = Path("datacenter/Alpha_data")
+        raw_align_dir = Path("datacenter/RawData/alignment")
+        datacenter_dir = Path("datacenter")
+        alpha_stg_dir = signals_dir / folder_name
+        
         possible_paths = [
-            signals_dir / f"{universe}_{timeframe}.parquet",
-            signals_dir / f"{universe}.parquet",
+            dc_path / "signals.parquet",
+            alpha_stg_dir / "*.parquet",
+            signals_dir / f"{universe_clean}_{timeframe}.parquet",
+            signals_dir / f"{universe_clean}.parquet",
+            raw_align_dir / f"{universe_clean}.parquet",
+            raw_align_dir / f"{universe_clean}_{timeframe}.parquet",
         ]
+        
         signal_path = None
-        for p in possible_paths:
-            if p.exists():
-                signal_path = str(p)
-                break
-        if not signal_path and signals_dir.exists():
-            candidates = sorted(signals_dir.rglob(f"{universe}*.parquet"))
-            if candidates:
-                signal_path = str(candidates[0])
+        # 1. 优先在匹配的工作区策略文件夹中寻找 Parquet 文件
+        if dc_path.exists():
+            parquets = list(dc_path.glob("signals.parquet"))
+            if not parquets:
+                parquets = list(dc_path.glob("*.parquet"))
+            if parquets:
+                signal_path = str(parquets[0])
+                
+        if not signal_path and alpha_stg_dir.exists():
+            parquets = list(alpha_stg_dir.glob("*.parquet"))
+            if parquets:
+                signal_path = str(parquets[0])
+                
+        # 2. 如果策略文件夹中未找到，则安全降级到原有的 universe 行情匹配逻辑（在 Alpha_data 和 RawData/alignment 搜索）
+        if not signal_path:
+            legacy_paths = [
+                signals_dir / f"{universe_clean}_{timeframe}.parquet",
+                signals_dir / f"{universe_clean}.parquet",
+                raw_align_dir / f"{universe_clean}.parquet",
+                raw_align_dir / f"{universe_clean}_{timeframe}.parquet",
+            ]
+            for p in legacy_paths:
+                if p.exists():
+                    signal_path = str(p)
+                    break
+            
+            # 3. 如果仍未找到，在 Alpha_data 目录递归模糊搜索
+            if not signal_path and signals_dir.exists():
+                candidates = sorted(signals_dir.rglob(f"{universe_clean}*.parquet"))
+                if candidates:
+                    signal_path = str(candidates[0])
+            
+            # 4. 如果仍未找到，在 RawData 目录递归模糊搜索
+            if not signal_path and datacenter_dir.exists():
+                candidates = sorted(datacenter_dir.rglob(f"*{universe_clean}*.parquet"))
+                if candidates:
+                    signal_path = str(candidates[0])
 
         if not signal_path:
             QMessageBox.critical(self, "File Not Found",
@@ -511,6 +778,10 @@ class RiskTab(QWidget):
         self.export_btn.setEnabled(True)
         self.export_btn.setStyleSheet(
             "background:#546E7A; color:white; padding:4px 10px; border-radius:4px;")
+        
+        self.report_btn.setEnabled(True)
+        self.report_btn.setStyleSheet(
+            "background:#2E7D32; color:white; padding:4px 10px; border-radius:4px; font-weight:bold;")
 
         base_m = results["base"].get("metrics", {})
         orig_m = results["original"].get("metrics", {})
@@ -628,6 +899,514 @@ class RiskTab(QWidget):
             self.comp_table.setItem(i, 2, color_item(o_val,  b_val, name))
             if has_override:
                 self.comp_table.setItem(i, 3, color_item(ov_val, o_val, name))
+
+    # ===========================================================
+    # EXPORT E2E QUANT FULL REPORT
+    # ===========================================================
+    # ===========================================================
+    # EXPORT E2E QUANT FULL REPORT
+    # ===========================================================
+    def _export_complete_report(self):
+        if not self.current_results:
+            QMessageBox.warning(self, "No Data", "Run an audit first.")
+            return
+
+        from PyQt6.QtWidgets import QFileDialog
+        from datetime import datetime
+        import copy
+        import json
+        import os
+        
+        folder_name = self.folder_combo.currentText()
+        stg_id = "UNKNOWN"
+        stg_name = folder_name
+        
+        # Protect memory references with deep copy
+        config = copy.deepcopy(getattr(self, "_current_config", {})) or {}
+        
+        metadata = config.get("metadata", {})
+        stg_id = metadata.get("strategy_id", stg_id)
+        stg_name = metadata.get("strategy_name", stg_name)
+        status = metadata.get("status", "BACKTESTED")
+        
+        default_filename = f"E2E_Quant_Report_{stg_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
+        save_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export End-to-End Report",
+            default_filename,
+            "HTML Files (*.html)"
+        )
+        if not save_path:
+            return
+
+        try:
+            # ── 1. Gather Alpha Stage info ─────────────────────
+            alpha_pipeline = config.get("alpha_pipeline", {})
+            alpha_profile = config.get("alpha_profile", {})
+            alpha_metrics = alpha_profile.get("metrics", {}) or {}
+            alpha_pro = alpha_profile.get("professional_metrics", {}) or {}
+            
+            expression = alpha_pipeline.get("expression", "N/A")
+            winsor_method = alpha_pipeline.get("winsor_method", "N/A")
+            quantile_lb = alpha_pipeline.get("quantile_lb", "N/A")
+            quantile_ub = alpha_pipeline.get("quantile_ub", "N/A")
+            risk_factors = alpha_pipeline.get("risk_factors", [])
+            ridge_alpha = alpha_pipeline.get("ridge_alpha", "N/A")
+            
+            # ── 2. Gather Backtest Stage info ──────────────────
+            backtest_profile = config.get("backtest_profile", {})
+            bt_settings = backtest_profile.get("settings", {}) or {}
+            bt_metrics = backtest_profile.get("metrics", {}) or {}
+            
+            # ── 3. Gather Risk Sentinel Stage info ─────────────
+            base_m = self.current_results["base"].get("metrics", {})
+            orig_m = self.current_results["original"].get("metrics", {})
+            has_override = "override" in self.current_results
+            over_m = self.current_results["override"].get("metrics", {}) if has_override else {}
+            
+            audit_log = self.current_results["original"].get("audit_log", [])
+            
+            approved_count = 0
+            adjusted_count = 0
+            rejected_count = 0
+            intercept_details = []
+            
+            for log in audit_log:
+                log_type = log.get("Type")
+                if log_type == "Order_Approved":
+                    approved_count += 1
+                elif log_type == "Order_Adjusted":
+                    adjusted_count += 1
+                    intercept_details.append(f"<b>Adjusted</b>: {log.get('Symbol')} {log.get('Direction')} x{log.get('Requested_Volume')} &rarr; x{log.get('Approved_Volume')}. Reason: {log.get('Reason')}")
+                elif log_type == "Order_Rejected":
+                    rejected_count += 1
+                    intercept_details.append(f"<span style='color:#f44336;'><b>Rejected</b></span>: {log.get('Symbol')} {log.get('Direction')} x{log.get('Requested_Volume')}. Reason: {log.get('Reason')}")
+
+            # Top 15 intercept highlights
+            intercept_html = "".join(f"<li>{item}</li>" for item in intercept_details[:15])
+            if len(intercept_details) > 15:
+                intercept_html += f"<li>...and {len(intercept_details) - 15} more compliance logs.</li>"
+            if not intercept_html:
+                intercept_html = "<li>No adjustments or rejections recorded. Perfect compliance.</li>"
+
+            # ── Pre-calculate formatting to avoid nested f-strings (for Python < 3.12 compatibility) ──
+            # 1) Alpha Preprocessing
+            ridge_alpha_html = ""
+            if risk_factors:
+                ridge_alpha_html = f"<li><strong>中性化 Ridge Alpha:</strong> {ridge_alpha}</li>"
+            
+            # 2) Half-Life formatting
+            half_life_val = alpha_pro.get('half_life', 0.0)
+            if isinstance(half_life_val, (int, float)) and half_life_val < 9999:
+                half_life_str = f"{half_life_val:.1f} 期"
+            else:
+                half_life_str = "Infinite / Oscillating"
+                
+            # 3) Risk Tracks Overrides Table columns
+            override_table_header = ""
+            override_table_net_profit = ""
+            override_table_mdd = ""
+            override_table_sharpe = ""
+            override_table_calmar = ""
+            override_table_pf = ""
+            override_table_trades = ""
+            override_track_card = ""
+            
+            if has_override:
+                override_table_header = "<th>Overridden DNA (超载游乐场)</th>"
+                override_table_net_profit = f'<td style="color:#ff9800; font-weight:bold;">{float(over_m.get("Net Profit", 0.0)):,.2f}</td>'
+                override_table_mdd = f"<td>{float(over_m.get('Max Drawdown (%)', 0.0)):.2f}%</td>"
+                override_table_sharpe = f"<td>{float(over_m.get('Sharpe Ratio', 0.0)):.2f}</td>"
+                override_table_calmar = f"<td>{float(over_m.get('Calmar Ratio', 0.0)):.2f}</td>"
+                override_table_pf = f"<td>{float(over_m.get('Profit Factor', 0.0)):.2f}</td>"
+                override_table_trades = f"<td>{int(over_m.get('Total Trades', 0))}</td>"
+                override_track_card = f"""<div class="track-card override">
+                    <h3>Overridden DNA (Sandbox)</h3>
+                    <p style="margin: 0; font-size: 12px; color: var(--text-muted);">
+                        在 Playground 游乐场手动超载参数后的审计结果。
+                        <b>恢复因子</b>: {float(over_m.get("Recovery Factor", 0.0)):.2f} | 
+                        <b>最大回撤持续天数</b>: {int(over_m.get("Max DD Duration", 0))} 天
+                    </p>
+                </div>"""
+
+            # Beautiful Premium CSS HSL dark mode report template
+            html_content = f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>E2E Quant Strategy Report - {stg_name}</title>
+    <style>
+        :root {{
+            --bg-color: #0d1117;
+            --card-bg: #161b22;
+            --border-color: #30363d;
+            --text-color: #c9d1d9;
+            --text-muted: #8b949e;
+            --primary: #4CAF50;
+            --primary-muted: rgba(76, 175, 80, 0.15);
+            --accent: #2196F3;
+            --accent-muted: rgba(33, 150, 243, 0.15);
+            --warning: #ff9800;
+            --warning-muted: rgba(255, 152, 0, 0.15);
+        }}
+        body {{
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            margin: 0;
+            padding: 40px 20px;
+            line-height: 1.6;
+        }}
+        .container {{
+            max-width: 1000px;
+            margin: 0 auto;
+        }}
+        header {{
+            border-bottom: 2px solid var(--border-color);
+            padding-bottom: 20px;
+            margin-bottom: 30px;
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-end;
+        }}
+        .header-title h1 {{
+            margin: 0;
+            font-size: 28px;
+            color: #ffffff;
+            font-weight: 700;
+            letter-spacing: -0.5px;
+        }}
+        .header-title p {{
+            margin: 5px 0 0 0;
+            color: var(--text-muted);
+            font-size: 14px;
+        }}
+        .status-badge {{
+            background-color: var(--primary-muted);
+            color: var(--primary);
+            border: 1px solid var(--primary);
+            padding: 6px 14px;
+            border-radius: 20px;
+            font-size: 13px;
+            font-weight: bold;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }}
+        .status-badge.backtested {{
+            background-color: var(--accent-muted);
+            color: var(--accent);
+            border: 1px solid var(--accent);
+        }}
+        .status-badge.alpha_draft {{
+            background-color: var(--warning-muted);
+            color: var(--warning);
+            border: 1px solid var(--warning);
+        }}
+        .grid-3 {{
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 20px;
+            margin-bottom: 30px;
+        }}
+        .card {{
+            background-color: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 20px;
+            position: relative;
+        }}
+        .card h2 {{
+            margin: 0 0 15px 0;
+            font-size: 18px;
+            font-weight: 600;
+            color: #ffffff;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }}
+        .card-footer {{
+            margin-top: 15px;
+            padding-top: 10px;
+            border-top: 1px solid var(--border-color);
+            font-size: 12px;
+            color: var(--text-muted);
+        }}
+        .code-block {{
+            background-color: #090c10;
+            border: 1px solid var(--border-color);
+            padding: 12px;
+            border-radius: 6px;
+            font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, Courier, monospace;
+            font-size: 12px;
+            color: #ff7b72;
+            word-break: break-all;
+            white-space: pre-wrap;
+            margin: 10px 0;
+        }}
+        table {{
+            width: 100%;
+            border-collapse: collapse;
+            margin: 15px 0;
+            font-size: 13px;
+        }}
+        th, td {{
+            text-align: left;
+            padding: 10px 12px;
+            border-bottom: 1px solid var(--border-color);
+        }}
+        th {{
+            background-color: #1f242c;
+            color: #ffffff;
+            font-weight: 600;
+        }}
+        tr:nth-child(even) {{
+            background-color: #161b2255;
+        }}
+        .highlight {{
+            color: var(--primary);
+            font-weight: bold;
+        }}
+        .highlight-accent {{
+            color: var(--accent);
+            font-weight: bold;
+        }}
+        .list-unstyled {{
+            list-style: none;
+            padding: 0;
+            margin: 0;
+        }}
+        .list-unstyled li {{
+            margin-bottom: 8px;
+            font-size: 13px;
+        }}
+        .list-unstyled li strong {{
+            color: #ffffff;
+        }}
+        .risk-tracks-section {{
+            background-color: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 24px;
+            margin-bottom: 30px;
+        }}
+        .risk-tracks-section h2 {{
+            margin-top: 0;
+            color: #ffffff;
+            font-size: 20px;
+        }}
+        .track-grid {{
+            display: grid;
+            grid-template-columns: repeat({3 if has_override else 2}, 1fr);
+            gap: 15px;
+            margin-top: 15px;
+        }}
+        .track-card {{
+            border-left: 4px solid #888888;
+            padding-left: 15px;
+        }}
+        .track-card.base {{
+            border-left-color: #888888;
+        }}
+        .track-card.original {{
+            border-left-color: var(--accent);
+        }}
+        .track-card.override {{
+            border-left-color: var(--warning);
+        }}
+        .track-card h3 {{
+            margin: 0 0 10px 0;
+            font-size: 15px;
+            color: #ffffff;
+        }}
+        .audit-trail {{
+            background-color: #1c1212;
+            border: 1px solid #4a2424;
+            border-radius: 8px;
+            padding: 20px;
+        }}
+        .audit-trail h2 {{
+            margin-top: 0;
+            color: #ff7b72;
+            font-size: 18px;
+        }}
+        .audit-trail ul {{
+            padding-left: 20px;
+            margin: 10px 0 0 0;
+            font-size: 13px;
+        }}
+        .audit-trail li {{
+            margin-bottom: 8px;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <div class="header-title">
+                <h1>E2E 量化策略全景研报 - {stg_name}</h1>
+                <p>ID: {stg_id} | 报告生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+            </div>
+            <div>
+                <span class="status-badge {status.lower()}">{status}</span>
+            </div>
+        </header>
+
+        <!-- 1. Factor Mining Stage -->
+        <div class="grid-3">
+            <div class="card">
+                <h2>🔍 1. 因子挖掘 (Alpha Discovery)</h2>
+                <div class="list-unstyled">
+                    <li><strong>因子表达式:</strong></li>
+                    <div class="code-block">{expression}</div>
+                    <li><strong>极端值缩尾:</strong> {winsor_method}</li>
+                    <li><strong>分位数剪裁:</strong> [{quantile_lb}, {quantile_ub}]</li>
+                    <li><strong>行业/风险对齐:</strong> {", ".join(risk_factors) if risk_factors else "None (No Neutralization)"}</li>
+                    {ridge_alpha_html}
+                </div>
+                <div class="card-footer">
+                    生命周期起跑点: ALPHA_DRAFT
+                </div>
+            </div>
+
+            <!-- 2. Backtest Stage -->
+            <div class="card">
+                <h2>📈 2. 历史回测 (Backtesting)</h2>
+                <table style="margin: 0;">
+                    <tr><th>参数</th><th>设定值</th></tr>
+                    <tr><td>初始资金</td><td>RM {float(bt_settings.get("initial_capital", 100000.0)):,.2f}</td></tr>
+                    <tr><td>手续费成本</td><td>RM {float(bt_settings.get("commission", 15.0)):,.2f}</td></tr>
+                    <tr><td>执行滑点点数</td><td>{float(bt_settings.get("slippage", 1.0)):.1f} Pts</td></tr>
+                    <tr><td>最高持仓限制</td><td>{int(bt_settings.get("max_lots", 20))} Lots</td></tr>
+                    <tr><td>委托执行时点</td><td>{bt_settings.get("execution_mode", "Close")}</td></tr>
+                </table>
+                <div class="card-footer">
+                    资产转换状态: BACKTESTED
+                </div>
+            </div>
+
+            <!-- Alpha Performance Stats -->
+            <div class="card">
+                <h2>📊 因子检验绩效 (Alpha Metrics)</h2>
+                <table style="margin: 0;">
+                    <tr><th>指标</th><th>因子检验值</th></tr>
+                    <tr><td>Rank IC Mean</td><td class="highlight-accent">{float(alpha_metrics.get("Rank IC_Mean", 0.0)):.4f}</td></tr>
+                    <tr><td>ICIR</td><td>{float(alpha_metrics.get("ICIR", 0.0)):.4f}</td></tr>
+                    <tr><td>胜率 Win Rate</td><td>{float(alpha_metrics.get("Win Rate", 0.0))*100:.2f}%</td></tr>
+                    <tr><td>NeweyWest T-Stat</td><td>{float(alpha_metrics.get("NW T-Stat", 0.0)):.2f}</td></tr>
+                    <tr><td>自相关系数 (1期)</td><td>{float(alpha_pro.get("autocorrelation", 0.0)):.4f}</td></tr>
+                    <tr><td>半衰期 (Half-Life)</td><td>{half_life_str}</td></tr>
+                </table>
+                <div class="card-footer">
+                    因子置信度静态审计数据
+                </div>
+            </div>
+        </div>
+
+        <!-- 3. Risk Sentinel Triple-Track Audit -->
+        <div class="risk-tracks-section">
+            <h2>🛡️ 3. 风控合规双轨对撞审计 (Risk Sentinel Audit)</h2>
+            <p style="font-size: 13px; color: var(--text-muted); margin-top: 0;">
+                风控哨兵通过将原始信号与严格的资本控制、逐笔订单资金/杠杆拦截器在同一历史行情下对撞，检验策略的实际生存率：
+            </p>
+            
+            <table>
+                <thead>
+                    <tr>
+                        <th>量化绩效指标 (Performance Metrics)</th>
+                        <th>Base (Gross 毛收益)</th>
+                        <th>Original DNA (合规净收益)</th>
+                        {override_table_header}
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><b>净利润 (Net Profit, RM)</b></td>
+                        <td>{float(base_m.get("Net Profit", 0.0)):,.2f}</td>
+                        <td class="highlight">{float(orig_m.get("Net Profit", 0.0)):,.2f}</td>
+                        {override_table_net_profit}
+                    </tr>
+                    <tr>
+                        <td><b>最大回撤 (Max Drawdown, %)</b></td>
+                        <td>{float(base_m.get("Max Drawdown (%)", 0.0)):.2f}%</td>
+                        <td>{float(orig_m.get("Max Drawdown (%)", 0.0)):.2f}%</td>
+                        {override_table_mdd}
+                    </tr>
+                    <tr>
+                        <td><b>夏普比率 (Sharpe Ratio)</b></td>
+                        <td>{float(base_m.get("Sharpe Ratio", 0.0)):.2f}</td>
+                        <td>{float(orig_m.get("Sharpe Ratio", 0.0)):.2f}</td>
+                        {override_table_sharpe}
+                    </tr>
+                    <tr>
+                        <td><b>卡玛比率 (Calmar Ratio)</b></td>
+                        <td>{float(base_m.get("Calmar Ratio", 0.0)):.2f}</td>
+                        <td class="highlight-accent">{float(orig_m.get("Calmar Ratio", 0.0)):.2f}</td>
+                        {override_table_calmar}
+                    </tr>
+                    <tr>
+                        <td><b>盈亏比 (Profit Factor)</b></td>
+                        <td>{float(base_m.get("Profit Factor", 0.0)):.2f}</td>
+                        <td>{float(orig_m.get("Profit Factor", 0.0)):.2f}</td>
+                        {override_table_pf}
+                    </tr>
+                    <tr>
+                        <td><b>总交易笔数 (Total Trades)</b></td>
+                        <td>{int(base_m.get("Total Trades", 0))}</td>
+                        <td>{int(orig_m.get("Total Trades", 0))}</td>
+                        {override_table_trades}
+                    </tr>
+                </tbody>
+            </table>
+
+            <div class="track-grid">
+                <div class="track-card base">
+                    <h3>Base (Gross Alpha)</h3>
+                    <p style="margin: 0; font-size: 12px; color: var(--text-muted);">无任何杠杆限制或止损约束。代表因子的原始收益能力上限。总交易数不受拦截限制。</p>
+                </div>
+                <div class="track-card original">
+                    <h3>Original DNA Track</h3>
+                    <p style="margin: 0; font-size: 12px; color: var(--text-muted);">
+                        受到 DNA 严密封闭的风控拦截。
+                        <b>恢复因子 (Recovery Factor)</b>: {float(orig_m.get("Recovery Factor", 0.0)):.2f} | 
+                        <b>最大回撤持续天数</b>: {int(orig_m.get("Max DD Duration", 0))} 天
+                    </p>
+                </div>
+                {override_track_card}
+            </div>
+        </div>
+
+        <!-- 4. Sentinel Audit Intercept footprint -->
+        <div class="audit-trail">
+            <h2>🛡️ 风控拦截足迹与审计日志 (Audit Trail Highlights)</h2>
+            <div style="display: flex; gap: 40px; margin-bottom: 15px; font-size: 13px;">
+                <div>🟢 <b>核准开仓 (Approved Lots):</b> {approved_count}</div>
+                <div>限制开仓 🟡 <b>仓位微调 (Adjusted Lots):</b> {adjusted_count}</div>
+                <div>限制开仓 🔴 <b>拒绝开仓 (Rejected Entries):</b> {rejected_count}</div>
+            </div>
+            <ul>
+                {intercept_html}
+            </ul>
+        </div>
+    </div>
+</body>
+</html>
+"""
+
+            with open(save_path, 'w', encoding='utf-8') as f:
+                f.write(html_content)
+
+            QMessageBox.information(
+                self,
+                "Report Exported",
+                f"Successfully exported beautiful end-to-end strategy report to:\n\n{save_path}"
+            )
+        except Exception as e:
+            import traceback
+            QMessageBox.critical(
+                self,
+                "Export Error",
+                f"An error occurred while compiling the report:\n{str(e)}\n\n{traceback.format_exc()}"
+            )
 
     # ===========================================================
     # EXPORT AUDIT LOG — Folder-based, one CSV per track

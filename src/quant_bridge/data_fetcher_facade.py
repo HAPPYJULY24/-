@@ -395,17 +395,17 @@ class DataFetcher:
         # 'Futures - Global' -> 'FUTURES_GLOBAL'
         
         type_map = {
-            'Malaysia Stock': 'MYSTOCK',
-            'US Stock': 'US_Stock',
-            'Crypto': 'CRYPTO_data',
-            'Bursa Futures (TV)': 'Bursa_Futures_data',
-            'Futures - Global': 'International_Futures_data',
-            'FX': 'FX'
+            'Malaysia Stock': 'MY_stock',
+            'US Stock': 'US_stock',
+            'Crypto': 'Crypto',
+            'Bursa Futures (TV)': 'BF',
+            'Futures - Global': 'IF',
+            'FX': 'currency'
         }
         folder_name = type_map.get(asset_type, 'OTHERS')
         
         # Create directory if not exists
-        base_dir = Path("DataCenter/RawData") / folder_name
+        base_dir = Path("datacenter/RawData") / folder_name
         base_dir.mkdir(parents=True, exist_ok=True)
         
         # 2. Sanitize Filename

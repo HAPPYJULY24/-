@@ -73,13 +73,27 @@ class RiskDashboardCharts(QWidget):
             return
             
         # 1. Align time series using Outer Join to keep timelines mathematically locked
-        aligned = pd.merge(
+        raw_merged = pd.merge(
             base_df[['equity']].rename(columns={'equity': 'eq_base'}),
             audit_df[['equity', 'used_margin']].rename(columns={'equity': 'eq_audit', 'used_margin': 'margin_audit'}),
             left_index=True,
             right_index=True,
             how='outer'
-        ).sort_index().ffill()
+        ).sort_index()
+        
+        # --- CRITICAL FIX: Safe Timeline Alignment without Masking Original NaNs ---
+        # Detect the actual termination boundary of the Audited Strategy
+        last_valid_audit_idx = audit_df.index[-1] if not audit_df.empty else None
+        
+        aligned = raw_merged.copy()
+        aligned['eq_base'] = aligned['eq_base'].ffill()
+        aligned['eq_audit'] = aligned['eq_audit'].ffill()
+        aligned['margin_audit'] = aligned['margin_audit'].ffill()
+        
+        # For margin, any timestamps AFTER the audited strategy ended must be forced to 0.0
+        if last_valid_audit_idx is not None:
+            post_liquidation_mask = aligned.index > last_valid_audit_idx
+            aligned.loc[post_liquidation_mask, 'margin_audit'] = 0.0
         
         # 2. Extract synchronized time coordinates
         idx = aligned.index
@@ -128,6 +142,9 @@ class RiskDashboardCharts(QWidget):
             
             # Disable X mouse events, only allow Y control to prevent event blocking
             self.p2.setMouseEnabled(x=False, y=True)
+            
+            # Prevent top ViewBox from swallowing horizontal zoom/drag events
+            self.p2.handleMouse = False
             
             # Connect resize signal safely (GC-defended & signal accumulation proofed)
             try:
@@ -185,3 +202,19 @@ class RiskDashboardCharts(QWidget):
         if p1 is not None and self.p2 is not None:
             self.p2.setGeometry(p1.vb.sceneBoundingRect())
             self.p2.linkedViewChanged(p1.vb, self.p2.XAxis)
+
+    def closeEvent(self, event):
+        """Clean up scene references and disconnect signals on widget close to prevent memory leaks."""
+        p1 = self.plot_widget.getPlotItem()
+        if p1 is not None:
+            try:
+                p1.vb.sigResized.disconnect(self._update_right_axis_geometry)
+            except TypeError:
+                pass
+            if self.p2 is not None:
+                try:
+                    p1.scene().removeItem(self.p2)
+                except Exception:
+                    pass
+                self.p2 = None
+        super().closeEvent(event)

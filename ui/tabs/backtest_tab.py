@@ -334,18 +334,24 @@ class BacktestTab(QWidget):
         self.refresh_files()
         
     def refresh_files(self):
-        """Scan DataCenter/Alpha_data/"""
-        path = Path("DataCenter/Alpha_data")
-        if not path.exists():
-            path.mkdir(parents=True, exist_ok=True)
+        """Scan datacenter/Alpha_data/"""
+        from utils.cache_manager import CacheManager
+        
+        alpha_path = CacheManager.get_alpha_storage_dir()
+        
+        files = []
+        if alpha_path.exists():
+            files.extend(list(alpha_path.rglob("*.parquet")))
             
-        files = list(path.rglob("*.parquet"))
         self.file_combo.clear()
         if files:
-            # Store relative paths so that the combobox shows parent folder + filename
-            # e.g., STG_001_MyAlpha/STG_001_data.parquet
+            seen = set()
             for f in files:
-                rel_path = str(f.relative_to(path))
+                abs_str = str(f.absolute())
+                if abs_str in seen:
+                    continue
+                seen.add(abs_str)
+                rel_path = str(f.relative_to(alpha_path))
                 self.file_combo.addItem(rel_path, str(f))
         else:
             self.file_combo.addItem("No signals found")
@@ -383,13 +389,14 @@ class BacktestTab(QWidget):
         path = self.file_combo.currentData()
         if not path:
             # Fallback just in case
-            path = str(Path("DataCenter/Alpha_data") / filename)
+            path = str(Path("datacenter/Alpha_data") / filename)
             
         import os
         from src.core.models.strategy_config import StrategyConfig
         
         # 1. 自动读取与装载 (Load)
         json_path = path.replace('_data.parquet', '_config.json')
+            
         configurator = None
         if os.path.exists(json_path):
             try:
@@ -416,7 +423,7 @@ class BacktestTab(QWidget):
         # DNA will read from these frozen snapshots, NOT from live UI controls.
         self._last_run_params = dict(params)
         self._last_signal_path = path
-        self._last_json_path = json_path if os.path.exists(json_path) else None
+        self._last_json_path = json_path
 
         self.run_btn.setEnabled(False)
         self.run_btn.setText("⏳ Running...")
@@ -433,7 +440,7 @@ class BacktestTab(QWidget):
         
         path = self.file_combo.currentData()
         if not path:
-            path = str(Path("DataCenter/Alpha_data") / filename)
+            path = str(Path("datacenter/Alpha_data") / filename)
         
         params = self._get_params()
         
@@ -489,10 +496,26 @@ class BacktestTab(QWidget):
         from src.core.models.strategy_config import StrategyConfig
         
         json_path = getattr(self, '_last_json_path', None)
-        if json_path and os.path.exists(json_path):
+        if json_path:
             try:
-                # 1. Deserialize
-                config = StrategyConfig.from_json(json_path)
+                # 1. Deserialize or Initialize
+                if os.path.exists(json_path):
+                    config = StrategyConfig.from_json(json_path)
+                else:
+                    # Initialize in-memory config for new workspace
+                    stg_name = Path(self._last_signal_path).parent.name
+                    from src.core.models.strategy_config import StrategyMetadata, EnvironmentConfig, AlphaPipelineConfig, AlphaProfile, BacktestProfile
+                    config = StrategyConfig(
+                        metadata=StrategyMetadata(
+                            strategy_id=stg_name,
+                            strategy_name=stg_name,
+                            status="BACKTESTED"
+                        ),
+                        environment_config=EnvironmentConfig(universe="unknown", timeframe="unknown"),
+                        alpha_pipeline=AlphaPipelineConfig(expression=""),
+                        alpha_profile=AlphaProfile(metrics={}, professional_metrics={}),
+                        backtest_profile=BacktestProfile(settings={}, metrics={})
+                    )
                 
                 # 2. Update Profile & Embed Metrics
                 config.backtest_profile.settings = self._last_run_params
@@ -512,13 +535,13 @@ class BacktestTab(QWidget):
                 if config.metadata.status == "ALPHA_DRAFT":
                     config.metadata.status = "BACKTESTED"
                 
-                # Overwrite DNA
+                # Overwrite DNA config
                 config.to_json(json_path)
                 
                 # 4. Dump Trade Log CSV into the same folder
+                folder_path = Path(self._last_signal_path).parent
                 trades_df = results.get('trades')
                 if trades_df is not None and not trades_df.empty:
-                    folder_path = Path(self._last_signal_path).parent
                     stg_id = config.metadata.strategy_id
                     trades_df.to_csv(folder_path / f"{stg_id}_tradelog.csv", index=False)
                 
@@ -681,11 +704,36 @@ class BacktestTab(QWidget):
             # 2. Prepare DNA
             dna = self.generate_strategy_dna()
             
+            # Load unified config if it exists for dual-backups (E2E full pipeline integration)
+            unified_config_data = None
+            if hasattr(self, '_last_json_path') and self._last_json_path and os.path.exists(self._last_json_path):
+                try:
+                    with open(self._last_json_path, 'r', encoding='utf-8') as f:
+                        unified_config_data = json.load(f)
+                except Exception as ex:
+                    print(f"[WARNING] Could not read unified config from {self._last_json_path}: {ex}")
+            
             # 3. Create folders and write files
             paths_created = []
-            trade_log_filename = f"{trade_log_base}.csv" # Dynamic extension fallback
-            dna_filename = f"{dna_base}.json"
             
+            is_workspace = False
+            # 2. Prepare DNA
+            dna = self.generate_strategy_dna()
+            
+            # Load unified config if it exists for dual-backups (E2E full pipeline integration)
+            unified_config_data = None
+            if hasattr(self, '_last_json_path') and self._last_json_path and os.path.exists(self._last_json_path):
+                try:
+                    with open(self._last_json_path, 'r', encoding='utf-8') as f:
+                        unified_config_data = json.load(f)
+                except Exception as ex:
+                    print(f"[WARNING] Could not read unified config from {self._last_json_path}: {ex}")
+            
+            # 3. Create folders and write files
+            paths_created = []
+            trade_log_filename = f"{trade_log_base}.csv"
+            dna_filename = f"{dna_base}.json"
+            unified_filename = f"{dna_base}_config.json"
             dc_path = CacheManager.get_backtest_storage_dir() / folder_name
             
             if save_mode in ['data_center', 'both']:
@@ -693,6 +741,9 @@ class BacktestTab(QWidget):
                 df.to_csv(str(dc_path / trade_log_filename), index=False)
                 with open(dc_path / dna_filename, "w", encoding="utf-8") as f:
                     json.dump(dna, f, indent=2, ensure_ascii=False)
+                if unified_config_data:
+                    with open(dc_path / unified_filename, "w", encoding="utf-8") as f:
+                        json.dump(unified_config_data, f, indent=4, ensure_ascii=False)
                 paths_created.append(f"Data Center:\n{dc_path}")
                 
             if save_mode in ['local', 'both']:
@@ -702,11 +753,15 @@ class BacktestTab(QWidget):
                 if save_mode == 'both':
                     shutil.copy2(str(dc_path / trade_log_filename), str(local_path / trade_log_filename))
                     shutil.copy2(str(dc_path / dna_filename), str(local_path / dna_filename))
+                    if unified_config_data and (dc_path / unified_filename).exists():
+                        shutil.copy2(str(dc_path / unified_filename), str(local_path / unified_filename))
                 else:
                     df.to_csv(str(local_path / trade_log_filename), index=False)
                     with open(local_path / dna_filename, "w", encoding="utf-8") as f:
                         json.dump(dna, f, indent=2, ensure_ascii=False)
-                
+                    if unified_config_data:
+                        with open(local_path / unified_filename, "w", encoding="utf-8") as f:
+                            json.dump(unified_config_data, f, indent=4, ensure_ascii=False)
                 paths_created.append(f"Local Export:\n{local_path}")
             
             msg = "Successfully exported Backtest Info to:\n\n" + "\n\n".join(paths_created)

@@ -175,6 +175,11 @@ class RiskManager:
         if atr is None or pd.isna(atr) or atr <= 0:
             return 0 
 
+        # --- CRITICAL FIX: Block new positions if account is liquidated ---
+        if getattr(self.state, 'is_liquidated', False):
+            logger.warning("🚨 [LEGACY_RISK] Sizing rejected: Account is under liquidation state.")
+            return 0
+
         risk_per_trade = self.params['risk_per_trade']
         multiplier = self.multiplier
         equity = self.state.equity

@@ -24,7 +24,7 @@ class DataManagerDialog(QDialog):
         self.setMinimumSize(1000, 700)
         
         # Ensure signals dir exists
-        self.signals_dir = Path("DataCenter/Alpha_data")
+        self.signals_dir = Path("datacenter/Alpha_data")
         self.signals_dir.mkdir(parents=True, exist_ok=True)
         
         self._init_ui()
@@ -115,7 +115,7 @@ class DataManagerDialog(QDialog):
         filter_layout.addWidget(filter_label)
         
         self.category_filter = QComboBox()
-        self.category_filter.addItems(["全部 (All)", "MYSTOCK", "US_Stock", "International_Futures_data", "Bursa_Futures_data", "CRYPTO_data", "Align_data", "Unknown"])
+        self.category_filter.addItems(["全部 (All)", "MY_stock", "US_stock", "IF", "BF", "Crypto", "currency", "alignment", "Unknown"])
         self.category_filter.setMinimumWidth(200)
         self.category_filter.currentIndexChanged.connect(self.refresh_raw_data)
         filter_layout.addWidget(self.category_filter)

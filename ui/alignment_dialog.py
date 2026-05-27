@@ -98,8 +98,8 @@ class AlignmentDialog(QDialog):
         self.setMinimumSize(1000, 750)
         
         # 数据目录
-        self.store_dir = Path("DataCenter/RawData")
-        self.output_dir = Path("DataCenter/RawData/Align_data")
+        self.store_dir = Path("datacenter/RawData")
+        self.output_dir = Path("datacenter/RawData/alignment")
         
         # Lazy import after directory setup
         from src.core.data_processor import DataProcessor
@@ -348,7 +348,7 @@ class AlignmentDialog(QDialog):
     # ========== 文件扫描 ==========
     
     def _scan_parquet_files(self):
-        """扫描 DataCenter/RawData 目录下的所有 Parquet 文件"""
+        """扫描 datacenter/RawData 目录下的所有 Parquet 文件"""
         try:
             if not self.store_dir.exists():
                 self.store_dir.mkdir(parents=True, exist_ok=True)

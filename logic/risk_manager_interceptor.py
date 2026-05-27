@@ -29,6 +29,19 @@ class RiskConfig:
         with open(json_path, 'r', encoding='utf-8') as f:
             dna = json.load(f)
             
+        if "backtest_profile" in dna and "settings" in dna["backtest_profile"]:
+            settings = dna.get("backtest_profile", {}).get("settings", {}) or {}
+            return RiskConfig(
+                initial_capital=float(settings.get("initial_capital", 100000.0)),
+                initial_margin=float(settings.get("initial_margin", 5000.0)),
+                risk_target_pct=float(settings.get("risk_target", 1.0)),
+                max_position_size=int(settings.get("max_lots", 20)),
+                multiplier=float(settings.get("multiplier", 25.0)),
+                adx_filter_enabled=bool(settings.get("use_adx_filter", False)),
+                leverage_limit=float(settings.get("leverage_limit", 10.0)),
+                sl_pct=float(settings.get("sl_pct", 0.0))
+            )
+            
         return RiskConfig(
             initial_capital=float(dna["environment"].get("initial_capital", 100000.0)),
             initial_margin=float(dna["backtest_risk_settings"].get("initial_margin", 5000.0)),
@@ -141,6 +154,10 @@ class RiskManager:
         Puppet Mode: Passive State Sync (BACKWARD COMPATIBLE).
         Accept state from BacktestEngine.
         """
+        # If already liquidated, do not overwrite the state or check further to preserve original liquidation reason
+        if self.state.is_liquidated:
+            return
+
         self.state.balance = balance
         self.state.equity = equity
         self.state.current_pos = current_pos
@@ -148,8 +165,16 @@ class RiskManager:
         
         # 1. Daily baseline tracking with Gap Risk Protection
         if current_date is not None:
-            bar_day = current_date.date() if hasattr(current_date, 'date') else str(current_date)[:10]
-            if self._current_day != bar_day:
+            # Check if current_date is a datetime-like object or has a date method
+            if hasattr(current_date, 'date'):
+                bar_day = current_date.date()
+            elif isinstance(current_date, str) and len(current_date) >= 10:
+                bar_day = current_date[:10]
+            else:
+                # If it's an integer or other non-date type, do not perform daily reset
+                bar_day = None
+
+            if bar_day is not None and self._current_day != bar_day:
                 # Today's baseline is yesterday's final closing equity to capture Overnight Gap risk
                 self._daily_baseline_equity = getattr(self, '_last_bar_equity', equity)
                 self._current_day = bar_day
@@ -324,6 +349,29 @@ class RiskManager:
                 self._log_rejection(order, response)
                 return response
             
+        # --- CRITICAL FIX: Direct Bypass Pipeline for Exit/Close Orders ---
+        if getattr(order, 'is_exit', False):
+            order_sign = 1 if order.direction_str == 'LONG' else -1
+            # Ensure exit orders ONLY reduce existing positions. Never allow net new reverse positioning.
+            current_pos = self.state.current_pos
+            if current_pos == 0:
+                return OrderResponse.reject(reason="Exit order rejected: No active position to close.")
+            if np.sign(current_pos) == np.sign(order_sign):
+                return OrderResponse.reject(reason="Exit order rejected: Direction increases risk exposure.")
+            
+            # Clamp the exit volume to maximum of current active lots to prevent reversal opening
+            allowed_exit_volume = min(order.volume, abs(current_pos))
+            new_pos = current_pos + (allowed_exit_volume * order_sign)
+            self.state.current_pos = new_pos
+            self.state.used_margin = abs(new_pos) * self.config.initial_margin
+            
+            final_response = OrderResponse.approve(
+                volume=allowed_exit_volume,
+                reason=f"Exit Order: Executed safe close portion of {allowed_exit_volume} lots. Excess volume of {order.volume - allowed_exit_volume} discarded."
+            )
+            self._log_approval(order, final_response)
+            return final_response
+            
         # Layer 1: Regime Check
         regime_response = self._check_regime_layer(order)
         if not regime_response.approved:
@@ -382,6 +430,10 @@ class RiskManager:
         if not self.params['use_adx']:
             return OrderResponse.approve(order.volume, "Regime: ADX check disabled")
         
+        # Check for NaN to prevent NaN-swallowing regime bypass
+        if pd.isna(order.adx) or np.isnan(order.adx):
+            return OrderResponse.reject(reason="Regime: ADX value is NaN. Blocked entry.")
+
         if order.adx < self.params['adx_threshold']:
             return OrderResponse.reject(
                 reason=f"Regime: ADX too low ({order.adx:.2f} < {self.params['adx_threshold']})",
@@ -401,6 +453,9 @@ class RiskManager:
         # Calculate raw risk amount
         risk_per_trade = self.config.risk_target_pct / 100.0
         sizing_equity = min(self.config.initial_capital, self.state.equity)
+        if sizing_equity <= 0:
+            return OrderResponse.reject(reason="[BANKRUPTCY_BREACH] Position Sizing Blocked: Equity is non-positive or bankrupt.")
+            
         risk_amount = sizing_equity * risk_per_trade
         
         # Risk distance hierarchy
@@ -433,6 +488,10 @@ class RiskManager:
         order_sign = 1 if order.direction_str == 'LONG' else -1
         curr_pos = self.state.current_pos
         
+        # Check for NaN in equity or free margin to prevent NaN-swallowing order bypass
+        if pd.isna(self.state.equity) or np.isnan(self.state.equity) or pd.isna(self.state.free_margin) or np.isnan(self.state.free_margin):
+            return OrderResponse.reject(reason="[NaN_EXPOSURE_BREACH] Margin check rejected: Account equity or free margin is NaN.")
+
         # 1. Determine Closing vs New Exposure
         if curr_pos == 0 or (curr_pos > 0 and order_sign > 0) or (curr_pos < 0 and order_sign < 0):
             closing_lots = 0
@@ -454,11 +513,12 @@ class RiskManager:
         if required_margin > effective_free_margin:
             # Smart Truncation
             if self.config.initial_margin > 0:
-                affordable_new_lots = int(effective_free_margin // self.config.initial_margin)
+                safe_free_margin = max(0.0, effective_free_margin)
+                affordable_new_lots = int(safe_free_margin // self.config.initial_margin)
             else:
                 affordable_new_lots = new_lots
                 
-            affordable_total_lots = closing_lots + affordable_new_lots
+            affordable_total_lots = max(0, closing_lots + affordable_new_lots)
             
             if affordable_total_lots == 0:
                 return OrderResponse.reject(
@@ -491,10 +551,29 @@ class RiskManager:
         if abs(projected_pos) <= abs(curr_pos):
             return OrderResponse.approve(approved_volume, "Leverage: Position reduction approved")
             
+        # --- CRITICAL FIX: Block new positions if account equity is bankrupt/negative ---
+        if self.state.equity <= 0:
+            return OrderResponse.reject(
+                reason="[BANKRUPTCY_BREACH] Leverage check rejected: Account equity is non-positive or bankrupt."
+            )
+            
         # Calculate Real Notional Leverage: Notional Exposure / Equity
         # Notional Exposure = abs(Projected Pos) * Entry Price * Multiplier
         projected_notional_exposure = abs(projected_pos) * order.price * self.config.multiplier
-        projected_leverage = projected_notional_exposure / self.state.equity if self.state.equity > 0 else 0.0
+        
+        # Check for NaN in equity or notional exposure to prevent NaN-swallowing order bypass
+        if pd.isna(self.state.equity) or np.isnan(self.state.equity) or pd.isna(projected_notional_exposure) or np.isnan(projected_notional_exposure):
+            return OrderResponse.reject(
+                reason="[NaN_EXPOSURE_BREACH] Leverage check rejected: Account equity or projected leverage is NaN."
+            )
+
+        projected_leverage = projected_notional_exposure / self.state.equity
+        
+        # Check for NaN in projected leverage
+        if pd.isna(projected_leverage) or np.isnan(projected_leverage):
+            return OrderResponse.reject(
+                reason="[NaN_EXPOSURE_BREACH] Leverage check rejected: Projected leverage is NaN."
+            )
         
         if projected_leverage > self.config.leverage_limit:
             # Smart Truncation to fit leverage limit using price and multiplier
@@ -503,8 +582,13 @@ class RiskManager:
             else:
                 max_allowed_pos = approved_volume
                 
-            # Max additional volume we can add in this direction
-            allowed_additional = max(0, max_allowed_pos - abs(curr_pos))
+            # --- CRITICAL FIX: Handle Reversal properly under leverage checks ---
+            is_reversal = (curr_pos > 0 and order_sign < 0) or (curr_pos < 0 and order_sign > 0)
+            if is_reversal:
+                # First abs(curr_pos) is just closing, then we can open up to max_allowed_pos
+                allowed_additional = abs(curr_pos) + max_allowed_pos
+            else:
+                allowed_additional = max(0, max_allowed_pos - abs(curr_pos))
             
             if allowed_additional == 0:
                 return OrderResponse.reject(

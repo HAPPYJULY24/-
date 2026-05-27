@@ -642,7 +642,7 @@ class FetcherTab(QWidget):
 
     def _try_auto_process_data(self):
         from pathlib import Path
-        store_dir = Path("DataCenter/RawData")
+        store_dir = Path("datacenter/RawData")
         
         # Support deep folder structure (v2.6 Master DB Refactor)
         fcpo_files = list(store_dir.rglob("*FCPO1!_15m.parquet"))
@@ -651,7 +651,7 @@ class FetcherTab(QWidget):
         if fcpo_files and zl_files:
             self.status_banner.show_info("正在生成对齐后的数据集...")
             from src.core.data_processor import DataProcessor
-            processor = DataProcessor(store_dir="DataCenter/RawData", output_dir="DataCenter/RawData/Align_data")
+            processor = DataProcessor(store_dir="datacenter/RawData", output_dir="datacenter/RawData/alignment")
             # Logic to invoke processor can go here if needed as a separate thread or call
 
     def _on_export_clicked(self, format_type='csv'):
