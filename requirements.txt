@@ -12,3 +12,4 @@ pytest
 pytz
 scipy
 scikit-learn
+numba

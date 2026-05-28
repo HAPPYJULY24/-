@@ -7,9 +7,162 @@ Features: Multi-period IC, Adaptive Panel/TS Mode, Enhanced Statistics.
 import pandas as pd
 import numpy as np
 from sklearn.linear_model import Ridge, LinearRegression
-from scipy.stats import zscore, t
+from scipy.stats import zscore, t, rankdata
 import warnings
 import ast
+import os
+from pathlib import Path
+
+try:
+    import numba as nb
+    HAS_NUMBA = True
+except ImportError:
+    HAS_NUMBA = False
+
+# =========================================================
+# 静态编译与 Fallback 时序百分位秩/Z-Score 核心加速器
+# =========================================================
+if HAS_NUMBA:
+    @nb.njit(cache=True)
+    def numba_expanding_rank_pct(arr: np.ndarray, min_periods: int = 10) -> np.ndarray:
+        n = arr.shape[0]
+        out = np.empty(n, dtype=np.float64)
+        for i in range(min_periods - 1):
+            if i < n:
+                out[i] = np.nan
+        for i in range(min_periods - 1, n):
+            val = arr[i]
+            if np.isnan(val):
+                out[i] = np.nan
+                continue
+            less_count = 0
+            equal_count = 0
+            valid_count = 0
+            for j in range(i + 1):
+                x = arr[j]
+                if not np.isnan(x):
+                    valid_count += 1
+                    if x < val:
+                        less_count += 1
+                    elif x == val:
+                        equal_count += 1
+            if valid_count >= min_periods:
+                rank = less_count + 0.5 * (equal_count - 1) + 1.0
+                out[i] = rank / valid_count
+            else:
+                out[i] = np.nan
+        return out
+
+    @nb.njit(cache=True)
+    def numba_rolling_zscore(arr: np.ndarray, window: int = 30) -> np.ndarray:
+        n = arr.shape[0]
+        out = np.empty(n, dtype=np.float64)
+        for i in range(n):
+            if i < window - 1:
+                out[i] = 0.0
+                continue
+            valid_count = 0
+            sum_val = 0.0
+            for j in range(i - window + 1, i + 1):
+                val = arr[j]
+                if not np.isnan(val):
+                    valid_count += 1
+                    sum_val += val
+            if valid_count < window // 2 or valid_count < 2:
+                out[i] = 0.0
+                continue
+            mean_val = sum_val / valid_count
+            var_sum = 0.0
+            for j in range(i - window + 1, i + 1):
+                val = arr[j]
+                if not np.isnan(val):
+                    var_sum += (val - mean_val) ** 2
+            std_val = np.sqrt(var_sum / (valid_count - 1)) if valid_count > 1 else 0.0
+            if std_val > 1e-8:
+                out[i] = (arr[i] - mean_val) / std_val
+            else:
+                out[i] = 0.0
+        return out
+else:
+    def numba_expanding_rank_pct(arr: np.ndarray, min_periods: int = 10) -> np.ndarray:
+        return vectorized_expanding_rank_pct(arr, min_periods)
+        
+    def numba_rolling_zscore(arr: np.ndarray, window: int = 30) -> np.ndarray:
+        return numba_rolling_zscore_fallback(arr, window)
+
+
+def vectorized_expanding_rank_pct(arr: np.ndarray, min_periods: int = 10) -> np.ndarray:
+    """
+    NumPy / SciPy 绝对等价的 Fallback 百分位秩计算器
+    使用 scipy.stats.rankdata(..., method='average')，保证和 numba_expanding_rank_pct 在数学上 100% 单点无偏对齐。
+    """
+    n = len(arr)
+    out = np.empty(n, dtype=np.float64)
+    out.fill(np.nan)
+    for i in range(min_periods - 1, n):
+        prefix = arr[:i+1]
+        valid_mask = ~np.isnan(prefix)
+        valid_count = np.sum(valid_mask)
+        if valid_count < min_periods:
+            continue
+        val = arr[i]
+        if np.isnan(val):
+            continue
+        valid_prefix = prefix[valid_mask]
+        ranks = rankdata(valid_prefix, method='average')
+        out[i] = ranks[-1] / valid_count
+    return out
+
+
+def numba_rolling_zscore_fallback(arr: np.ndarray, window: int = 30) -> np.ndarray:
+    n = arr.shape[0]
+    out = np.empty(n, dtype=np.float64)
+    for i in range(n):
+        if i < window - 1:
+            out[i] = 0.0
+            continue
+        slice_data = arr[i - window + 1 : i + 1]
+        valid_data = slice_data[~np.isnan(slice_data)]
+        valid_count = len(valid_data)
+        if valid_count < window // 2 or valid_count < 2:
+            out[i] = 0.0
+            continue
+        std_val = np.std(valid_data, ddof=1)
+        if std_val > 1e-8:
+            out[i] = (arr[i] - np.mean(valid_data)) / std_val
+        else:
+            out[i] = 0.0
+    return out
+
+
+def neutralize_ts_rolling(df: pd.DataFrame, factor_col: str, risk_cols: list, W: int = 60) -> pd.Series:
+    """
+    时序滚动 OLS 中性化：在 t 时刻，利用过去 W 天的滚动窗口拟合 Beta
+    然后用该无偏 Beta 剥离 t 时刻因子的风险暴露。
+    """
+    y = df[factor_col].values
+    X = df[risk_cols].values
+    n_samples = len(df)
+    resids = np.full(n_samples, np.nan)
+    resids[:W] = y[:W]
+    for t in range(W, n_samples):
+        X_train = X[t-W : t]
+        y_train = y[t-W : t]
+        valid_mask = ~np.isnan(X_train).any(axis=1) & ~np.isnan(y_train)
+        X_v = X_train[valid_mask]
+        y_v = y_train[valid_mask]
+        if len(y_v) > len(risk_cols) + 2:
+            try:
+                model = LinearRegression(fit_intercept=True)
+                model.fit(X_v, y_v)
+                pred_t = model.predict(X[t].reshape(1, -1))
+                resids[t] = y[t] - pred_t[0]
+            except Exception:
+                resids[t] = y[t]
+        else:
+            resids[t] = y[t]
+    return pd.Series(resids, index=df.index)
+
 
 
 class AlphaEngine:
@@ -80,6 +233,42 @@ class AlphaEngine:
                                 raise ValueError(f"Look-ahead bias detected: negative indexing in {node.value.attr} is forbidden.")
                         elif isinstance(sub_node, ast.Constant) and isinstance(val := getattr(sub_node, 'value', None), (int, float)) and val < 0:
                             raise ValueError(f"Look-ahead bias detected: negative indexing in {node.value.attr} is forbidden.")
+
+    @staticmethod
+    def calculate_execution_returns(df: pd.DataFrame, price_col: str, open_col: str | None = None, periods: list = [1]) -> pd.DataFrame:
+        """
+        无前瞻偏差收益率对齐：
+        如果 open_col 存在，信号在 t 期收盘触发，次日 t+1 期以开盘价买入，t+p 期以收盘价平仓：
+            ret = close_{t+p} / open_{t+1} - 1.0
+        如果 open_col 不存在，安全降级为普通的 close-to-close 前向收益率：
+            ret = close_{t+p} / close_t - 1.0
+        """
+        df = df.copy()
+        
+        # Determine open price candidate
+        if open_col:
+            open_col = str(open_col).lower()
+            if open_col not in df.columns:
+                open_col = None
+        
+        for p in periods:
+            col_name = f'ret_{p}'
+            if 'symbol' in df.columns:
+                def calc_lag_return(g):
+                    if open_col:
+                        return g[price_col].shift(-p) / g[open_col].shift(-1) - 1.0
+                    else:
+                        return g[price_col].shift(-p) / g[price_col] - 1.0
+                df[col_name] = df.groupby('symbol', group_keys=False).apply(calc_lag_return)
+            else:
+                if open_col:
+                    df[col_name] = df[price_col].shift(-p) / df[open_col].shift(-1) - 1.0
+                else:
+                    df[col_name] = df[price_col].shift(-p) / df[price_col] - 1.0
+            
+            df[col_name] = df[col_name].replace([np.inf, -np.inf], np.nan)
+            
+        return df
 
     @staticmethod
     def _clean_stat_value(value, default=0.0):
@@ -200,6 +389,74 @@ class AlphaEngine:
             if avg_obs > 1.5:
                 is_panel = True
 
+        # 自适应少量品种截面判断门限：N < 5 时，即使 is_panel = True，也自动降级为时序滚动标准化
+        symbol_count = df['symbol'].nunique() if 'symbol' in df.columns else 1
+        avg_obs = df.groupby('datetime').size().mean() if 'datetime' in df.columns else 1.0
+        is_few_symbols = (symbol_count < 5) or (avg_obs < 5.0)
+
+        # A. Winsorization
+        if is_panel and not is_few_symbols:
+            # 宽截面面板模式下的截面 winsorization
+            def preprocess_group(group):
+                group = group.copy()
+                if len(group) < 3:
+                    group['factor_winsor'] = group['factor']
+                    return group
+                method = config.get('winsor_method', '3-Sigma')
+                if method == '3-Sigma':
+                    sigma = 3
+                    mean = group['factor'].mean()
+                    std = group['factor'].std()
+                    group['factor'] = group['factor'].clip(lower=mean - sigma*std, upper=mean + sigma*std)
+                elif method == 'MAD':
+                    median = group['factor'].median()
+                    mad = (group['factor'] - median).abs().median()
+                    k = 1.4826 
+                    limit = 3 * k * mad
+                    group['factor'] = group['factor'].clip(lower=median - limit, upper=median + limit)
+                elif method == 'Quantile':
+                    lower = group['factor'].quantile(q_lb)
+                    upper = group['factor'].quantile(q_ub)
+                    group['factor'] = group['factor'].clip(lower=lower, upper=upper)
+                group['factor_winsor'] = group['factor']
+                return group
+            df = df.groupby('datetime', group_keys=False).apply(preprocess_group)
+        else:
+            # 时序模式或少品种时序模式下的无偏 winsorization
+            def preprocess_ts_expanding_single(df_ts):
+                df_ts = df_ts.copy()
+                method = config.get('winsor_method', '3-Sigma')
+                if method == '3-Sigma':
+                    expanding_mean = df_ts['factor'].expanding(min_periods=10).mean()
+                    expanding_std = df_ts['factor'].expanding(min_periods=10).std()
+                    lower = expanding_mean - 3 * expanding_std
+                    upper = expanding_mean + 3 * expanding_std
+                elif method == 'MAD':
+                    expanding_median = df_ts['factor'].expanding(min_periods=10).median()
+                    expanding_mad = (df_ts['factor'] - expanding_median).abs().expanding(min_periods=10).median()
+                    k = 1.4826
+                    limit = 3 * k * expanding_mad
+                    lower = expanding_median - limit
+                    upper = expanding_median + limit
+                elif method == 'Quantile':
+                    lower = df_ts['factor'].expanding(min_periods=10).quantile(q_lb)
+                    upper = df_ts['factor'].expanding(min_periods=10).quantile(q_ub)
+                else:
+                    lower = pd.Series(-np.inf, index=df_ts.index)
+                    upper = pd.Series(np.inf, index=df_ts.index)
+
+                lower = lower.ffill().fillna(-np.inf)
+                upper = upper.ffill().fillna(np.inf)
+                df_ts['factor'] = df_ts['factor'].clip(lower, upper, axis=0)
+                df_ts['factor_winsor'] = df_ts['factor']
+                return df_ts
+
+            if 'symbol' in df.columns:
+                df = df.groupby('symbol', group_keys=False).apply(preprocess_ts_expanding_single)
+            else:
+                df = preprocess_ts_expanding_single(df)
+
+        # B. Standardization
         def standardize_factor_group(group, source_col='factor', target_col='factor'):
             group = group.copy()
             std = group[source_col].std()
@@ -209,92 +466,20 @@ class AlphaEngine:
                 group[target_col] = 0.0
             return group
 
-        def standardize_factor_expanding(df_ts, source_col='factor', target_col='factor'):
-            """HIGH-03 FIX: Expanding-window z-score to avoid look-back bias in TS mode."""
-            df_ts = df_ts.copy()
-            expanding_mean = df_ts[source_col].expanding(min_periods=2).mean()
-            expanding_std = df_ts[source_col].expanding(min_periods=2).std()
-            df_ts[target_col] = (df_ts[source_col] - expanding_mean) / expanding_std
-            # First data point(s) have no std → fill with 0
-            df_ts[target_col] = df_ts[target_col].fillna(0.0)
-            # Handle zero std (constant series in early window)
-            df_ts[target_col] = df_ts[target_col].replace([np.inf, -np.inf], 0.0)
-            return df_ts
-
-        def preprocess_ts_expanding(df_ts):
-            """P0-4/Bug B: Expanding winsorization with min_periods=10 warm-up guard to prevent look-ahead bias."""
-            df_ts = df_ts.copy()
-            method = config.get('winsor_method', '3-Sigma')
-            
-            if method == '3-Sigma':
-                expanding_mean = df_ts['factor'].expanding(min_periods=10).mean()
-                expanding_std = df_ts['factor'].expanding(min_periods=10).std()
-                lower = expanding_mean - 3 * expanding_std
-                upper = expanding_mean + 3 * expanding_std
-            elif method == 'MAD':
-                expanding_median = df_ts['factor'].expanding(min_periods=10).median()
-                expanding_mad = (df_ts['factor'] - expanding_median).abs().expanding(min_periods=10).median()
-                k = 1.4826
-                limit = 3 * k * expanding_mad
-                lower = expanding_median - limit
-                upper = expanding_median + limit
-            elif method == 'Quantile':
-                lower = df_ts['factor'].expanding(min_periods=10).quantile(q_lb)
-                upper = df_ts['factor'].expanding(min_periods=10).quantile(q_ub)
-            else:
-                lower = pd.Series(-np.inf, index=df_ts.index)
-                upper = pd.Series(np.inf, index=df_ts.index)
-
-            # Warm-up fallback: use -inf / inf to avoid clipping early rows (cold start)
-            lower = lower.ffill().fillna(-np.inf)
-            upper = upper.ffill().fillna(np.inf)
-
-            # Dynamic clipping of Series vs Series
-            df_ts['factor'] = df_ts['factor'].clip(lower, upper, axis=0)
-            df_ts['factor_winsor'] = df_ts['factor']
-            return df_ts
-
-        def preprocess_group(group):
-            group = group.copy()
-            # HIGH-02 FIX: Skip winsorization+standardization for tiny cross-sections
-            # With < 3 assets, MAD/std are statistically meaningless
-            if len(group) < 3:
-                group['factor_winsor'] = group['factor']
-                return group
-            # A. Winsorization
-            method = config.get('winsor_method', '3-Sigma')
-            if method == '3-Sigma':
-                sigma = 3
-                mean = group['factor'].mean()
-                std = group['factor'].std()
-                group['factor'] = group['factor'].clip(lower=mean - sigma*std, upper=mean + sigma*std)
-            elif method == 'MAD':
-                 median = group['factor'].median()
-                 mad = (group['factor'] - median).abs().median()
-                 k = 1.4826 
-                 limit = 3 * k * mad
-                 group['factor'] = group['factor'].clip(lower=median - limit, upper=median + limit)
-            elif method == 'Quantile':
-                lower = group['factor'].quantile(q_lb)
-                upper = group['factor'].quantile(q_ub)
-                group['factor'] = group['factor'].clip(lower=lower, upper=upper)
-
-            group['factor_winsor'] = group['factor']
-            # B. Standardization
-            return standardize_factor_group(group)
-        # Apply preprocessing
-        if is_panel:
-             df = df.groupby('datetime', group_keys=False)[df.columns].apply(preprocess_group)
+        if is_panel and not is_few_symbols:
+            # 宽截面面板模式：截面 Z-Score 标准化
+            df = df.groupby('datetime', group_keys=False).apply(lambda g: standardize_factor_group(g))
         else:
-             # HIGH-03 FIX: TS mode uses config-switchable standardization method
-             ts_std_method = config.get('ts_standardization_method', 'expanding')
-             if ts_std_method == 'expanding':
-                 # Preprocess with expanding window winsorization to eliminate look-ahead bias
-                 df = preprocess_ts_expanding(df)
-                 df = standardize_factor_expanding(df)
-             else:
-                 # Fallback to full-sample winsorization + standardization
-                 df = preprocess_group(df)
+            # 时序模式或少品种时序模式：单品种时序滚动 Z-Score (硬化 Z-Score 降级与未来函数漏洞)
+            window = int(config.get('rolling_standardization_window', 60))
+            if 'symbol' in df.columns:
+                def apply_ts_zscore(g):
+                    g = g.copy()
+                    g['factor'] = numba_rolling_zscore(g['factor'].values, window)
+                    return g
+                df = df.groupby('symbol', group_keys=False).apply(apply_ts_zscore)
+            else:
+                df['factor'] = numba_rolling_zscore(df['factor'].values, window)
         # 3. Neutralization
         risk_factors_raw = config.get('risk_factors', [])
         # logic hardening: ensure all risk factors are lowercase to match normalized df
@@ -349,16 +534,65 @@ class AlphaEngine:
                     pass
                 return group
 
-            if is_panel:
-                df = df.groupby('datetime', group_keys=False)[df.columns].apply(neutralize_group)
+            if is_panel and not is_few_symbols:
+                df = df.groupby('datetime', group_keys=False).apply(neutralize_group)
             else:
-                df = neutralize_group(df)
+                # TS 模式或窄截面模式：使用时序滚动 OLS 中性化，严格防范未来函数泄漏
+                window = int(config.get('neutralization_rolling_window', 60))
+                
+                # 在时序中性化前对自变量进行 winsorize 和 standardize，避免 leverage-point 污染
+                def preprocess_ts_risks(g):
+                    g = g.copy()
+                    for col in risk_factors:
+                        # 1. 滚动 MAD 去极值
+                        median = g[col].expanding(min_periods=10).median()
+                        mad = (g[col] - median).abs().expanding(min_periods=10).median()
+                        mad = mad.replace(0.0, np.nan).ffill().fillna(1.0)
+                        limit = 3 * 1.4826 * mad
+                        lower = median - limit
+                        upper = median + limit
+                        g[col] = g[col].clip(lower, upper, axis=0)
+                        # 2. 滚动/扩张 Z-Score 标准化
+                        mean = g[col].expanding(min_periods=2).mean()
+                        std = g[col].expanding(min_periods=2).std()
+                        std = std.replace(0.0, np.nan).ffill().fillna(1.0)
+                        g[col] = (g[col] - mean) / std
+                        g[col] = g[col].fillna(0.0)
+                    return g
+
+                if 'symbol' in df.columns:
+                    df = df.groupby('symbol', group_keys=False).apply(preprocess_ts_risks)
+                else:
+                    df = preprocess_ts_risks(df)
+
+                # 运行滚动 OLS 回归中性化 (合入宽容兜底策略，防奇异矩阵崩溃)
+                if 'symbol' in df.columns:
+                    def apply_ts_neut(g):
+                        g = g.copy()
+                        g['factor'] = neutralize_ts_rolling(g, 'factor', risk_factors, window)
+                        return g
+                    df = df.groupby('symbol', group_keys=False).apply(apply_ts_neut)
+                else:
+                    df['factor'] = neutralize_ts_rolling(df, 'factor', risk_factors, window)
+
+                # 用于中性化覆盖率统计 dashboard
+                _total_rows = len(df)
+                _neutralized_rows = int(df.dropna(subset=['factor'] + risk_factors).shape[0])
 
             df['factor_neutralized'] = df['factor']
-            if is_panel:
-                df = df.groupby('datetime', group_keys=False)[df.columns].apply(standardize_factor_group)
+            if is_panel and not is_few_symbols:
+                df = df.groupby('datetime', group_keys=False).apply(lambda g: standardize_factor_group(g))
             else:
-                df = standardize_factor_group(df)
+                # 中性化后重新进行无偏时序滚动标准化
+                window_std = int(config.get('rolling_standardization_window', 60))
+                if 'symbol' in df.columns:
+                    def apply_ts_post_std(g):
+                        g = g.copy()
+                        g['factor'] = numba_rolling_zscore(g['factor'].values, window_std)
+                        return g
+                    df = df.groupby('symbol', group_keys=False).apply(apply_ts_post_std)
+                else:
+                    df['factor'] = numba_rolling_zscore(df['factor'].values, window_std)
         
         # 4. Multi-Period Forward Returns
         # Use explicit UI-selected target return column. Fall back only to
@@ -387,16 +621,9 @@ class AlphaEngine:
                 df = df.sort_values('datetime').copy()
 
             df[price_col] = pd.to_numeric(df[price_col], errors='coerce')
-            # We need robust shift logic. If 'symbol' exists, groupby symbol.
-            for p in periods:
-                col_name = f'ret_{p}'
-                if 'symbol' in df.columns:
-                     # Groupby transform is safer for panel to avoid MultiIndex misalignment
-                     df[col_name] = df.groupby('symbol')[price_col].transform(lambda x: x.shift(-p) / x - 1)
-                else:
-                     # Single asset mode
-                     df[col_name] = df[price_col].shift(-p) / df[price_col] - 1
-                df[col_name] = df[col_name].replace([np.inf, -np.inf], np.nan)
+            # 调用公开的前向收益率对齐计算接口，实现模块化硬化
+            open_col = next((c for c in ['open', 'first'] if c in df.columns), None)
+            df = self.calculate_execution_returns(df, price_col=price_col, open_col=open_col, periods=periods)
 
             df['target_return_price'] = df[price_col]
             df['target_return_col'] = price_col
@@ -459,12 +686,12 @@ class AlphaEngine:
                 # one rolling Rank IC series to avoid mixed statistical bases.
                 window = min(30, len(eval_period_df) // 2) if len(eval_period_df) > 30 else len(eval_period_df)
                 # Expanding rank with min_periods=10 warm-up guard to prevent look-ahead bias
-                ranked_factor = eval_period_df['factor'].expanding(min_periods=10).apply(
-                    lambda x: pd.Series(x).rank(pct=True).iloc[-1]
-                ).fillna(eval_period_df['factor'])
-                ranked_ret = eval_period_df[ret_col].expanding(min_periods=10).apply(
-                    lambda x: pd.Series(x).rank(pct=True).iloc[-1]
-                ).fillna(eval_period_df[ret_col])
+                # 静态编译/等价 Fallback 加速，彻底破除 O(N^2) 慢循环性能崩塌 (L669-674)
+                ranked_factor_vals = numba_expanding_rank_pct(eval_period_df['factor'].values, min_periods=10)
+                ranked_factor = pd.Series(ranked_factor_vals, index=eval_period_df.index).fillna(eval_period_df['factor'])
+                
+                ranked_ret_vals = numba_expanding_rank_pct(eval_period_df[ret_col].values, min_periods=10)
+                ranked_ret = pd.Series(ranked_ret_vals, index=eval_period_df.index).fillna(eval_period_df[ret_col])
                 rolling_rank_ic = ranked_factor.rolling(window=window).corr(ranked_ret)
                 
                 # BUG FIX: corr() can sometimes output np.inf or -np.inf due to precision/zero-division,
@@ -739,12 +966,12 @@ class AlphaEngine:
             # Keep rolling for UI series plot and win rate proxy (Using Spearman/Rank)
             window = min(30, len(valid_df) // 2) if len(valid_df) > 30 else len(valid_df)
             # Expanding rank with min_periods=10 warm-up guard to prevent look-ahead bias
-            ranked_factor_pro = valid_df[factor_name].expanding(min_periods=10).apply(
-                lambda x: pd.Series(x).rank(pct=True).iloc[-1]
-            ).fillna(valid_df[factor_name])
-            ranked_ret_pro = valid_df[returns_name].expanding(min_periods=10).apply(
-                lambda x: pd.Series(x).rank(pct=True).iloc[-1]
-            ).fillna(valid_df[returns_name])
+            # 静态编译/等价 Fallback 加速，破除 O(N^2) 慢循环 (L949-954)
+            ranked_factor_pro_vals = numba_expanding_rank_pct(valid_df[factor_name].values, min_periods=10)
+            ranked_factor_pro = pd.Series(ranked_factor_pro_vals, index=valid_df.index).fillna(valid_df[factor_name])
+            
+            ranked_ret_pro_vals = numba_expanding_rank_pct(valid_df[returns_name].values, min_periods=10)
+            ranked_ret_pro = pd.Series(ranked_ret_pro_vals, index=valid_df.index).fillna(valid_df[returns_name])
             rolling_rank_ic = ranked_factor_pro.rolling(window=window).corr(ranked_ret_pro)
             # Safely replace Inf values from Zero-Division correlation anomalies
             rolling_rank_ic = rolling_rank_ic.replace([np.inf, -np.inf], np.nan).dropna()
@@ -974,19 +1201,80 @@ class AlphaEngine:
         }
 
     @staticmethod
-    def write_signal_export_parquet(df: pd.DataFrame, filepath, metadata: dict | None = None) -> None:
+    def write_signal_export_parquet(
+        df: pd.DataFrame, 
+        filepath, 
+        metadata: dict | None = None,
+        expr_str: str | None = None,
+        timestamp_str: str | None = None
+    ) -> None:
         """
         Write an Alpha signal parquet file with key-value metadata preserved in
         the parquet schema for downstream Backtest/Risk modules.
+        
+        落盘文件名安全隔离：如果当前引擎处于单资产模式（df['symbol'].nunique() == 1），
+        文件名强制包含 {symbol} 字段，防范哈希相同冲突覆盖。
+        引入 os.replace 原子性临时文件写入机制，规避多进程写冲突。
         """
         import pyarrow as pa
         import pyarrow.parquet as pq
+        from pathlib import Path
+        import os
+        import hashlib
+        import datetime
 
-        table = pa.Table.from_pandas(df, preserve_index=False)
-        schema_metadata = dict(table.schema.metadata or {})
-        for key, value in (metadata or {}).items():
-            if value is None:
-                continue
-            schema_metadata[str(key).encode('utf-8')] = str(value).encode('utf-8')
-        table = table.replace_schema_metadata(schema_metadata)
-        pq.write_table(table, filepath)
+        filepath = Path(filepath)
+        parent_dir = filepath.parent
+        parent_dir.mkdir(parents=True, exist_ok=True)
+        
+        # 1. 单资产模式下，强制在文件名中注入 symbol、expr_hash 与 timestamp 进行磁盘隔离
+        if 'symbol' in df.columns and df['symbol'].nunique() == 1:
+            sym = str(df['symbol'].iloc[0]).replace('/', '_').replace('\\', '_')
+            if sym != 'SINGLE_ASSET' and sym not in filepath.name:
+                stem = filepath.stem
+                suffix = filepath.suffix
+                
+                # Retrieve or generate expr_hash
+                if expr_str is not None:
+                    expr_hash = hashlib.md5(expr_str.encode('utf-8')).hexdigest()[:5]
+                elif metadata and ('expr_str' in metadata or 'expr' in metadata or 'expression' in metadata):
+                    expr_val = metadata.get('expr_str') or metadata.get('expr') or metadata.get('expression')
+                    expr_hash = hashlib.md5(str(expr_val).encode('utf-8')).hexdigest()[:5]
+                else:
+                    expr_hash = "default"
+                
+                # Retrieve or generate timestamp_str
+                if timestamp_str is None:
+                    timestamp_str = datetime.datetime.now().strftime("%Y%m%d")
+                
+                filepath = filepath.with_name(f"{stem}_{sym}_{expr_hash}_v{timestamp_str}{suffix}")
+        
+        # 2. 写临时文件并原子覆盖，防止多进程冲突与文件锁死
+        temp_filepath = filepath.with_suffix(f"{filepath.suffix}.tmp")
+        
+        try:
+            table = pa.Table.from_pandas(df, preserve_index=False)
+            schema_metadata = dict(table.schema.metadata or {})
+            for key, value in (metadata or {}).items():
+                if value is None:
+                    continue
+                schema_metadata[str(key).encode('utf-8')] = str(value).encode('utf-8')
+            table = table.replace_schema_metadata(schema_metadata)
+            
+            # 先写入临时文件
+            pq.write_table(table, temp_filepath)
+            
+            # Windows 兼容性原子替换：若目标已存在，需显式先 remove 以免 replace 抛错
+            if os.path.exists(filepath):
+                try:
+                    os.remove(filepath)
+                except Exception:
+                    pass
+            os.replace(temp_filepath, filepath)
+        except Exception as e:
+            if os.path.exists(temp_filepath):
+                try:
+                    os.remove(temp_filepath)
+                except Exception:
+                    pass
+            raise e
