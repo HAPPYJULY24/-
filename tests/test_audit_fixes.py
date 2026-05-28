@@ -197,3 +197,225 @@ def test_parquet_export_versioning_and_hash_isolation(tmp_path):
     # 断言规则：必须同时包含基准名、symbol、版本标记 _v20260528
     assert "alpha_factor_MYX-FKLI1_" in filename
     assert "_v20260528.parquet" in filename
+
+
+def test_round_4_slippage_discrete_and_compliant_blotter():
+    """
+    【硬化测试 6】：严格验证 Round 4 升级中的微观撮合离散化吸附、滑点价格融入及完全合规 Blotter。
+    """
+    import math
+    from src.core.engines.bt_event_driven import EventDrivenBacktest
+    from logic.risk_manager_interceptor import RiskManager as Interceptor, RiskConfig
+    
+    dates = pd.date_range(start="2026-01-01", periods=3, freq="D")
+    df = pd.DataFrame({
+        'open': [100.0, 102.3, 105.7],
+        'high': [101.0, 103.0, 106.0],
+        'low':  [99.0,  101.0, 104.0],
+        'close': [101.0, 103.0, 105.0],
+        'factor': [0.0, 0.0, 0.0],
+        'atr': [2.0, 2.0, 2.0],
+        'adx': [25.0, 25.0, 25.0]
+    }, index=dates)
+    
+    df['signal'] = [1, 0, 0] # LONG signal on 01-01 -> Buy at 102.3 on 01-02. Exit at EOD close 105.0 on 01-03.
+    
+    engine = EventDrivenBacktest()
+    cfg = RiskConfig(
+        initial_capital=100000.0,
+        initial_margin=5000.0,
+        risk_target_pct=2.0,
+        max_position_size=1,
+        multiplier=25.0,
+        adx_filter_enabled=False
+    )
+    
+    commission = 15.0
+    slippage = 0.8  # Slippage price units = 0.8. Symbol is FCPO -> tick_size = 1.0.
+    
+    # Symmetrical Discretization Calculations:
+    # 1. Entry Buy: signal_price = 102.3, slippage = 0.8
+    #    exec_price = Ceil((102.3 + 0.8) / 1.0) * 1.0 = Ceil(103.1) = 104.0
+    # 2. Exit Sell (EOD Close): signal_price = 105.0, slippage = 0.8
+    #    exit_price = Floor((105.0 - 0.8) / 1.0) * 1.0 = Floor(104.2) = 104.0
+    # 3. PnL: (104.0 - 104.0) * 25.0 * 1 = 0.0
+    # 4. Commission paid: 2 * 15.0 = 30.0
+    # 5. Net Profit: 0.0 - 30.0 = -30.0
+    
+    res = engine.run(
+        df=df.copy(),
+        asset_symbol="FCPO", # Force FCPO config -> tick_size = 1.0
+        RiskManagerClass=lambda *a, **kw: Interceptor(cfg),
+        multiplier=25.0,
+        commission=commission,
+        slippage=slippage,
+        initial_capital=100000.0,
+        initial_margin=5000.0,
+        allow_lunch=True,
+        allow_overnight=True,
+        execution_mode='Next Open'
+    )
+    
+    trades = res['trades']
+    assert len(trades) == 1
+    trade = trades.iloc[0]
+    
+    # Assert Prices are embedded and discretized symmetrically
+    assert trade['entry_price'] == 104.0
+    assert trade['exit_price'] == 104.0
+    assert trade['net_pnl'] == -30.0
+    
+    # Assert Compliant Blotter fields
+    assert trade['requested_price'] == 105.0
+    assert trade['commission_paid'] == 30.0
+    assert trade['slippage_incurred'] == 2 * 0.8 * 25.0 * 1
+    assert trade['margin_occupied'] == 5000.0
+
+
+def test_round_4_vectorized_open_gap_and_zombie_truncation():
+    """
+    【硬化测试 7】：严格验证 Vectorized 引擎中的开盘跳空对称离散化及爆仓熔断截断（阻断僵尸交易）。
+    """
+    from src.core.engines.bt_vectorized import VectorizedBacktest
+    
+    dates = pd.date_range(start="2026-01-01", periods=4, freq="D")
+    df = pd.DataFrame({
+        'open':  [100.0, 100.0,  95.0, 108.0],
+        'high':  [101.0, 101.0,  96.0, 109.0],
+        'low':   [99.0,  99.0,   94.0, 107.0],
+        'close': [101.0, 101.0,  95.0, 108.0],
+        'factor': [0.0, 0.0, 0.0, 0.0],
+        'atr': [2.0, 2.0, 2.0, 2.0],
+        'adx': [25.0, 25.0, 25.0, 25.0]
+    }, index=dates)
+    
+    # Set pos to simulate trade: LONG entry on 01-02 -> exit at 01-03 due to SL breach on open
+    df['pos'] = [0, 1, 1, 1]
+    df['pos_raw'] = [0, 1, 1, 1]
+    
+    engine = VectorizedBacktest()
+    
+    # 1. Verify Symmetrical Open Gap Discretization in _apply_stop_loss
+    # For Next Open, entry_price is open of 01-02 = 100.0.
+    # sl_prices = 100.0 * 0.98 = 98.0.
+    # Next Open, open of next bar is 95.0, which breaches 98.0!
+    # If open is 95.0 (which breaches 98.0), actual exit should be:
+    # Floor((open - slippage) / tick_size) * tick_size
+    # With slippage = 0.5 and tick_size = 0.5 (multiplier 50.0):
+    # sl_gap_long_exit = Floor((95.0 - 0.5) / 0.5) * 0.5 = 94.5.
+    
+    res = engine._apply_stop_loss(
+        df=df.copy(),
+        sl_pct=2.0,
+        multiplier=50.0,
+        execution_mode='Next Open',
+        slippage=0.5,
+        tick_size=0.5
+    )
+    
+    # Trigger is true
+    assert np.isclose(res.loc[dates[2], 'sl_pnl'], (94.5 - res.loc[dates[2], 'ref_price']) * 50.0 * 1)
+    
+    # 2. Verify dynamic liquidation truncation in _calculate_equity_and_margin
+    # We will simulate a liquidation on 01-03 (equity falls below maintenance margin baseline)
+    df_liq = pd.DataFrame({
+        'pos': [1, 1, 1, 1],
+        'pos_change': [1.0, 0.0, 0.0, 0.0],
+        'gross_pnl': [10.0, -9000.0, -100.0, -100.0],
+        'cost': [10.0, 0.0, 0.0, 0.0],
+        'net_pnl': [0.0, -9000.0, -100.0, -100.0]
+    }, index=dates)
+    
+    res_liq = engine._calculate_equity_and_margin(
+        df=df_liq.copy(),
+        initial_capital=5000.0,
+        initial_margin=4000.0,
+        maintenance_margin_rate=0.8 # baseline is 3200.0
+    )
+    
+    # On Day 2 (01-02), equity drops from 5000.0 to -4000.0, which breaches 3200.0
+    # So it must trigger is_liquidated on 01-02 and set all subsequent pos to 0
+    assert res_liq.loc[dates[1], 'is_liquidated'] == True
+    assert (res_liq.loc[dates[2]:, 'pos'] == 0).all()
+    assert (res_liq.loc[dates[2]:, 'net_pnl'] == 0.0).all()
+
+
+def test_round_4_param_search_file_isolation_concurrency():
+    """
+    【硬化测试 8】：并发冲击测试。
+    模拟 10 个并发线程同时使用不同的策略参数和相同的基准文件名向同一个临时文件夹发起写入，
+    确保高精度时间戳与参数哈希组合的 Suffix 机制能提供绝对的文件名隔离，防止任何同名覆盖。
+    """
+    import concurrent.futures
+    import hashlib
+    import tempfile
+    import time
+    from pathlib import Path
+    from datetime import datetime
+    import pandas as pd
+    
+    # 模拟 10 组不同的策略参数
+    param_sets = [
+        {'multiplier': 25.0, 'commission': 15.0, 'slippage': 1.0, 'strategy': 'MR_1'},
+        {'multiplier': 25.0, 'commission': 15.0, 'slippage': 2.0, 'strategy': 'MR_2'},
+        {'multiplier': 50.0, 'commission': 15.0, 'slippage': 1.0, 'strategy': 'MR_3'},
+        {'multiplier': 50.0, 'commission': 10.0, 'slippage': 1.0, 'strategy': 'MR_4'},
+        {'multiplier': 25.0, 'commission': 20.0, 'slippage': 1.0, 'strategy': 'MR_5'},
+        {'multiplier': 25.0, 'commission': 15.0, 'slippage': 0.5, 'strategy': 'MR_6'},
+        {'multiplier': 50.0, 'commission': 25.0, 'slippage': 1.5, 'strategy': 'MR_7'},
+        {'multiplier': 25.0, 'commission': 5.0,  'slippage': 0.0, 'strategy': 'MR_8'},
+        {'multiplier': 50.0, 'commission': 30.0, 'slippage': 2.5, 'strategy': 'MR_9'},
+        {'multiplier': 25.0, 'commission': 12.0, 'slippage': 1.2, 'strategy': 'MR_10'},
+    ]
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        stg_id = "test_strategy"
+        
+        # 线程写入任务
+        def write_task(params):
+            # 模拟回测结果中的 trades 数据帧
+            df = pd.DataFrame({'trade_id': [1, 2], 'pnl': [100.0, -50.0]})
+            
+            # 使用与 backtest_tab.py 完全相同的哈希和高精度微秒级时间戳后缀生成算法
+            param_str = "_".join(f"{k}={v}" for k, v in sorted(params.items()) if isinstance(v, (int, float, str)))
+            param_hash = hashlib.md5(param_str.encode('utf-8')).hexdigest()[:8]
+            
+            # 引入极微小延迟以在并发下表现更真实
+            time.sleep(0.001)
+            timestamp_suffix = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            suffix = f"_{param_hash}_{timestamp_suffix}"
+            
+            # 构建目标文件名（模拟 tradelog, config 和 parquet 复制）
+            tradelog_path = tmp_path / f"{stg_id}_tradelog{suffix}.csv"
+            config_path = tmp_path / f"{stg_id}_config{suffix}.json"
+            parquet_path = tmp_path / f"{stg_id}_data{suffix}.parquet"
+            
+            # 执行物理写入
+            df.to_csv(tradelog_path, index=False)
+            with open(config_path, "w", encoding="utf-8") as f:
+                f.write('{"status": "BACKTESTED"}')
+            df.to_parquet(parquet_path, index=False)
+            
+            return str(tradelog_path), str(config_path), str(parquet_path)
+            
+        # 并发执行 10 个线程的写入冲击
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            futures = [executor.submit(write_task, p) for p in param_sets]
+            results = [f.result() for f in concurrent.futures.as_completed(futures)]
+            
+        # 收集产生的所有文件
+        all_tradelogs = list(tmp_path.glob("*_tradelog*.csv"))
+        all_configs = list(tmp_path.glob("*_config*.json"))
+        all_parquets = list(tmp_path.glob("*_data*.parquet"))
+        
+        # 核心断言 1：必须恰好稳固地产生 10 个独立的物理文件，没有任何同名覆盖
+        assert len(all_tradelogs) == 10
+        assert len(all_configs) == 10
+        assert len(all_parquets) == 10
+        
+        # 核心断言 2：文件绝对不能是空的，且数据大小符合规格
+        for tl_file in all_tradelogs:
+            assert tl_file.stat().st_size > 0
+            df_read = pd.read_csv(tl_file)
+            assert len(df_read) == 2

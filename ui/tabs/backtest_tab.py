@@ -544,40 +544,48 @@ class BacktestTab(QWidget):
                 
                 stg_id = config.metadata.strategy_id
                 
-                # 5. Save modern config `{stg_id}_config.json` inside Backtest_data
-                config.to_json(str(target_dir / f"{stg_id}_config.json"))
+                # Suffix generation using parameter MD5 hash and high-precision timestamp
+                import hashlib
+                from datetime import datetime
+                param_str = "_".join(f"{k}={v}" for k, v in sorted(self._last_run_params.items()) if isinstance(v, (int, float, str)))
+                param_hash = hashlib.md5(param_str.encode('utf-8')).hexdigest()[:8]
+                timestamp_suffix = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                suffix = f"_{param_hash}_{timestamp_suffix}"
                 
-                # 6. Save Legacy DNA backup `{stg_id}.json` inside Backtest_data
+                # 5. Save modern config `{stg_id}_config_{suffix}.json` inside Backtest_data
+                config.to_json(str(target_dir / f"{stg_id}_config{suffix}.json"))
+                
+                # 6. Save Legacy DNA backup `{stg_id}_{suffix}.json` inside Backtest_data
                 try:
                     dna = self.generate_strategy_dna()
                     # Ensure stg_id in DNA identification matches config
                     dna["identification"]["strategy_id"] = stg_id
-                    with open(target_dir / f"{stg_id}.json", "w", encoding="utf-8") as f:
+                    with open(target_dir / f"{stg_id}{suffix}.json", "w", encoding="utf-8") as f:
                         json.dump(dna, f, indent=2, ensure_ascii=False)
                 except Exception as dna_ex:
                     print(f"[WARNING] Failed to generate legacy DNA: {dna_ex}")
                 
-                # 7. Dump Trade Log CSV `{stg_id}_tradelog.csv` into Backtest_data
+                # 7. Dump Trade Log CSV `{stg_id}_tradelog_{suffix}.csv` into Backtest_data
                 trades_df = results.get('trades')
                 if trades_df is not None and not trades_df.empty:
-                    trades_df.to_csv(target_dir / f"{stg_id}_tradelog.csv", index=False)
+                    trades_df.to_csv(target_dir / f"{stg_id}_tradelog{suffix}.csv", index=False)
                 elif 'trade_log' in results and results['trade_log'] is not None and not results['trade_log'].empty:
-                    results['trade_log'].to_csv(target_dir / f"{stg_id}_tradelog.csv", index=False)
+                    results['trade_log'].to_csv(target_dir / f"{stg_id}_tradelog{suffix}.csv", index=False)
                 
-                # 8. Dump Equity Curve CSV `{stg_id}.csv` into Backtest_data
+                # 8. Dump Equity Curve CSV `{stg_id}_{suffix}.csv` into Backtest_data
                 if 'equity_curve' in results and results['equity_curve'] is not None:
                     eq_df = results['equity_curve']
                     if isinstance(eq_df, list):
                         eq_df = pd.DataFrame(eq_df)
                     if hasattr(eq_df, 'to_csv'):
-                        eq_df.to_csv(target_dir / f"{stg_id}.csv", index=False)
+                        eq_df.to_csv(target_dir / f"{stg_id}{suffix}.csv", index=False)
                 elif trades_df is not None and not trades_df.empty:
-                    trades_df.to_csv(target_dir / f"{stg_id}.csv", index=False)
+                    trades_df.to_csv(target_dir / f"{stg_id}{suffix}.csv", index=False)
                 
-                # 9. Copy the source signal Parquet file from Alpha_data to Backtest_data as `{stg_id}_data.parquet`
+                # 9. Copy the source signal Parquet file from Alpha_data to Backtest_data as `{stg_id}_data_{suffix}.parquet`
                 if os.path.exists(signal_path):
-                    shutil.copy2(signal_path, target_dir / f"{stg_id}_data.parquet")
-                    print(f"[INFO] Copied signal parquet to backtest folder: {target_dir / f'{stg_id}_data.parquet'}")
+                    shutil.copy2(signal_path, target_dir / f"{stg_id}_data{suffix}.parquet")
+                    print(f"[INFO] Copied signal parquet to backtest folder: {target_dir / f'{stg_id}_data{suffix}.parquet'}")
                 
                 # Update UI Alert Banner to confirm Relay
                 self.audit_label.setText(self.audit_label.text() + " | 🔋 Auto-Relay: SAVED TO BACKTEST_DATA")
@@ -763,11 +771,19 @@ class BacktestTab(QWidget):
                 except Exception as ex:
                     print(f"[WARNING] Could not read unified config from {self._last_json_path}: {ex}")
             
+            # Suffix generation using parameter MD5 hash and high-precision timestamp
+            import hashlib
+            from datetime import datetime
+            param_str = "_".join(f"{k}={v}" for k, v in sorted(self._last_run_params.items()) if isinstance(v, (int, float, str)))
+            param_hash = hashlib.md5(param_str.encode('utf-8')).hexdigest()[:8]
+            timestamp_suffix = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            suffix = f"_{param_hash}_{timestamp_suffix}"
+            
             # 3. Create folders and write files
             paths_created = []
-            trade_log_filename = f"{trade_log_base}.csv"
-            dna_filename = f"{dna_base}.json"
-            unified_filename = f"{dna_base}_config.json"
+            trade_log_filename = f"{trade_log_base}{suffix}.csv"
+            dna_filename = f"{dna_base}{suffix}.json"
+            unified_filename = f"{dna_base}_config{suffix}.json"
             dc_path = CacheManager.get_backtest_storage_dir() / folder_name
             
             if save_mode in ['data_center', 'both']:

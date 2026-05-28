@@ -65,6 +65,20 @@ class VectorizedBacktest:
         # 1. Prepare Data
         df = self._prepare_dataframe(df)
         
+        # Resolve tick_size from AssetConfig or fallback
+        tick_size = 1.0
+        if 'symbol' in df.columns:
+            sym = str(df['symbol'].iloc[0]).upper()
+            if "FKLI" in sym:
+                tick_size = 0.5
+            elif "FCPO" in sym:
+                tick_size = 1.0
+        else:
+            if multiplier == 50.0:
+                tick_size = 0.5
+            elif multiplier == 25.0:
+                tick_size = 1.0
+
         # 2. Calculate Risk Indicators
         if 'atr' not in df.columns:
             df['atr'] = self._calculate_atr(df)
@@ -88,7 +102,7 @@ class VectorizedBacktest:
         df = self._calculate_position_size(df, risk_target, initial_capital, multiplier, max_lots)
         
         # 6. Execution & PnL Logic
-        df = self._calculate_pnl(df, execution_mode, multiplier, sl_pct, commission, slippage)
+        df = self._calculate_pnl(df, execution_mode, multiplier, sl_pct, commission, slippage, tick_size)
         
         # 7. Equity Curve & Margin (internal only — not exposed in return dict)
         df = self._calculate_equity_and_margin(df, initial_capital, initial_margin, maintenance_margin_rate)
@@ -240,9 +254,8 @@ class VectorizedBacktest:
             df['pos_raw'] = df['signal']
         
         return df
-    
     def _calculate_pnl(self, df: pd.DataFrame, execution_mode: str, multiplier: float,
-                       sl_pct: float, commission: float, slippage: float) -> pd.DataFrame:
+                       sl_pct: float, commission: float, slippage: float, tick_size: float = 1.0) -> pd.DataFrame:
         """Calculate PnL with optional stop loss."""
         # Execution & PnL Logic
         if execution_mode == 'Next Open':
@@ -258,7 +271,7 @@ class VectorizedBacktest:
         
         # Stop Loss Logic (Vectorized)
         if sl_pct > 0:
-            df = self._apply_stop_loss(df, sl_pct, multiplier, execution_mode)
+            df = self._apply_stop_loss(df, sl_pct, multiplier, execution_mode, slippage, tick_size)
         else:
             # Basic PnL
             df['gross_pnl'] = df['price_change'] * multiplier * df['pos']
@@ -272,8 +285,8 @@ class VectorizedBacktest:
         return df
     
     def _apply_stop_loss(self, df: pd.DataFrame, sl_pct: float, multiplier: float,
-                         execution_mode: str) -> pd.DataFrame:
-        """Apply vectorized stop loss logic without look-ahead bias."""
+                          execution_mode: str, slippage: float = 0.0, tick_size: float = 1.0) -> pd.DataFrame:
+        """Apply vectorized stop loss logic without look-ahead bias and with symmetrical gap exits."""
         # 1. Identify trade IDs
         df['trade_id'] = (df['pos'] != df['pos'].shift(1).fillna(0)).cumsum()
         
@@ -333,10 +346,25 @@ class VectorizedBacktest:
             
         df['ref_price'] = np.where(first_bar_mask, df['entry_price'], standard_ref)
         
-        # 8. Calculate standard and stop PnL
+        # 8. Symmetrical Discretization on Vectorized Open Gap Exits
+        if execution_mode == 'Next Open':
+            # Long Exit Gap (Sell) floor discretization
+            sl_gap_long_exit = np.floor((df['open'] - slippage) / tick_size) * tick_size
+            # Short Exit Gap (Buy) ceil discretization
+            sl_gap_short_exit = np.ceil((df['open'] + slippage) / tick_size) * tick_size
+            
+            sl_exit_prices = np.where(
+                df['pos'] > 0,
+                np.where(df['open'] < df['sl_prices'], sl_gap_long_exit, df['sl_prices']),
+                np.where(df['open'] > df['sl_prices'], sl_gap_short_exit, df['sl_prices'])
+            )
+        else:
+            sl_exit_prices = df['sl_prices']
+            
+        # Calculate standard and stop PnL
         current_price = df['open'].shift(-1) if execution_mode == 'Next Open' else df['close']
         df['normal_pnl'] = (current_price - df['ref_price']) * multiplier * df['pos']
-        df['sl_pnl'] = (df['sl_prices'] - df['ref_price']) * multiplier * df['pos']
+        df['sl_pnl'] = (sl_exit_prices - df['ref_price']) * multiplier * df['pos']
         
         # Assemble final gross PnL
         df['gross_pnl'] = np.where(
@@ -353,11 +381,71 @@ class VectorizedBacktest:
     
     def _calculate_equity_and_margin(self, df: pd.DataFrame, initial_capital: float,
                                      initial_margin: float, maintenance_margin_rate: float) -> pd.DataFrame:
-        """Calculate equity curve and margin requirements."""
-        df['equity'] = initial_capital + df['net_pnl'].cumsum()
-        df['used_margin'] = df['pos'].abs() * initial_margin
-        df['maint_level'] = df['used_margin'] * maintenance_margin_rate
-        df['is_liquidated'] = df['equity'] < df['maint_level']
+        """Calculate equity curve and margin requirements with real-time liquidation truncation."""
+        n = len(df)
+        pos = df['pos'].values.copy()
+        gross_pnl = df['gross_pnl'].values.copy()
+        cost = df['cost'].values.copy()
+        net_pnl = df['net_pnl'].values.copy()
+        
+        equity = np.zeros(n)
+        used_margin = np.zeros(n)
+        maint_level = np.zeros(n)
+        is_liquidated = np.zeros(n, dtype=bool)
+        
+        # Extract cost_per_lot
+        mask = df['pos_change'] > 0
+        cost_per_lot = (df.loc[mask, 'cost'] / df.loc[mask, 'pos_change']).iloc[0] if mask.any() else 0.0
+        
+        current_equity = initial_capital
+        liquidated = False
+        
+        for i in range(n):
+            if liquidated:
+                pos[i] = 0
+                gross_pnl[i] = 0.0
+                if i > 0 and pos[i-1] != 0:
+                    pos_change = abs(pos[i] - pos[i-1])
+                    cost[i] = pos_change * cost_per_lot
+                else:
+                    cost[i] = 0.0
+                net_pnl[i] = gross_pnl[i] - cost[i]
+                
+            current_equity = initial_capital + net_pnl[:i+1].sum()
+            equity[i] = current_equity
+            
+            # Check margin requirement
+            used_margin[i] = abs(pos[i]) * initial_margin
+            maint_level[i] = used_margin[i] * maintenance_margin_rate
+            
+            # Trigger liquidation if equity falls below maintenance margin baseline AND we hold a position
+            if not liquidated and pos[i] != 0 and current_equity < maint_level[i]:
+                liquidated = True
+                is_liquidated[i] = True
+                # Truncate position immediately at the liquidation bar
+                pos[i] = 0
+                gross_pnl[i] = 0.0  # Liquidation closes at the bar's entry/ref price, so no further holding PnL
+                pos_change = abs(pos[i] - pos[i-1]) if i > 0 else 0.0
+                cost[i] = pos_change * cost_per_lot
+                net_pnl[i] = gross_pnl[i] - cost[i]
+                
+                # Re-calculate equity for this bar after truncation
+                current_equity = initial_capital + net_pnl[:i+1].sum()
+                equity[i] = current_equity
+                used_margin[i] = 0.0
+                maint_level[i] = 0.0
+                
+        df['pos'] = pos
+        df['gross_pnl'] = gross_pnl
+        df['cost'] = cost
+        df['net_pnl'] = net_pnl
+        df['equity'] = equity
+        df['used_margin'] = used_margin
+        df['maint_level'] = maint_level
+        df['is_liquidated'] = is_liquidated
+        
+        # Update pos_change to match the truncated position
+        df['pos_change'] = df['pos'].diff().abs().fillna(0)
         
         return df
     

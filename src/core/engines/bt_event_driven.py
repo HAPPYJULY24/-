@@ -6,6 +6,7 @@ Bar-by-bar execution loop with RiskManager integration and Position tracking.
 import pandas as pd
 import numpy as np
 import logging
+import math
 from typing import Dict, Optional, List
 from datetime import datetime
 
@@ -86,6 +87,20 @@ class EventDrivenBacktest:
         # 1. Initialize RiskManager
         if risk_params is None:
             risk_params = {}
+            
+        # Resolve tick_size from AssetConfig or fallback
+        try:
+            from src.core.models.asset import get_asset_config
+            asset_cfg = get_asset_config(asset_symbol)
+            tick_size = asset_cfg.tick_size
+        except Exception:
+            if "FKLI" in str(asset_symbol).upper():
+                tick_size = 0.5
+            elif "FCPO" in str(asset_symbol).upper():
+                tick_size = 1.0
+            else:
+                tick_size = 1.0
+        self._emit_log(f"[CONFIG] Resolved Tick Size = {tick_size}")
         
         rm = RiskManagerClass(
             initial_capital=initial_capital,
@@ -180,8 +195,7 @@ class EventDrivenBacktest:
             
             if hasattr(rm, 'sync_account_state'):
                 rm.sync_account_state(current_balance, open_equity, current_pos_signed, current_used_margin, current_date=row.Index)
-            
-            # Step I-1: Execute the pending order at the OPEN of the current bar
+                      # Step I-1: Execute the pending order at the OPEN of the current bar
             if pending_action != 0:
                 if execution_mode == 'Close':
                     fill_price = df.iloc[i-1]['close'] if i > 0 else row.open
@@ -190,28 +204,38 @@ class EventDrivenBacktest:
 
                 if pending_action == 2:  # Close command
                     if current_position is not None and current_position.lots > 0:
-                        exit_price = fill_price
                         lots_closed = current_position.lots
                         dir_val = current_position.direction.value
                         direction_mult = 1 if dir_val == "LONG" or dir_val == 1 else -1
+                        
+                        # Apply exit slippage and discretization (Price-Embedded Slippage)
+                        if direction_mult == 1:  # Closing LONG: Sell order (Floor)
+                            exit_price = math.floor((fill_price - slippage) / tick_size) * tick_size
+                        else:  # Closing SHORT: Buy order (Ceil)
+                            exit_price = math.ceil((fill_price + slippage) / tick_size) * tick_size
+                            
                         pnl_gross = (exit_price - current_position.avg_entry_price) * direction_mult * multiplier * lots_closed
-                        cost_val = (commission + (slippage * multiplier)) * lots_closed
-                        pnl_net = pnl_gross - 2 * cost_val
+                        exit_cost = commission * lots_closed
+                        pnl_net = pnl_gross - 2 * commission * lots_closed
                         
                         # GUARD: trades_list.append is ONLY called inside pending_action block
                         trades_list.append({
                             'entry_time': current_position.entry_time,
                             'exit_time': row.Index,
-                            'entry_price': current_position.avg_entry_price,  # FIX: was .avg_price
+                            'entry_price': current_position.avg_entry_price,
                             'exit_price': exit_price,
                             'direction': current_position.direction.value,
                             'lots': current_position.lots,
                             'net_pnl': pnl_net,
-                            'exit_reason': "Signal_Close"
+                            'exit_reason': "Signal_Close",
+                            'requested_price': fill_price,
+                            'commission_paid': 2 * commission * lots_closed,
+                            'slippage_incurred': 2 * slippage * multiplier * lots_closed,
+                            'margin_occupied': lots_closed * initial_margin
                         })
                         
-                        current_balance += pnl_gross - cost_val
-                        net_pnl_arr[i] = pnl_net  # FIX: was never written — now recorded immediately
+                        current_balance += pnl_gross - exit_cost
+                        net_pnl_arr[i] = pnl_net
                         current_position = None
                         
                         self._emit_log(f"🔄 [{row.Index}] PHASE I — T+1 Close at {exit_price:.2f} | Net PnL={pnl_net:.2f}")
@@ -223,6 +247,12 @@ class EventDrivenBacktest:
                         atr_val = getattr(row, 'atr', getattr(row, 'ATR', 0))
                         adx_val = getattr(row, 'adx', getattr(row, 'ADX', 0))
                         
+                        # Apply entry slippage and discretization (Price-Embedded Slippage)
+                        if pending_action == 1:  # Buying: LONG entry (Ceil)
+                            exec_price = math.ceil((fill_price + slippage) / tick_size) * tick_size
+                        else:  # Selling: SHORT entry (Floor)
+                            exec_price = math.floor((fill_price - slippage) / tick_size) * tick_size
+                        
                         # Intent volume: pass caller's max_lots (or large sentinel) so the
                         # Interceptor's _check_sizing_layer can cap it to the correct value.
                         intent_volume = risk_params.get('max_lots', 999) if risk_params else 999
@@ -231,7 +261,7 @@ class EventDrivenBacktest:
                             volume=intent_volume,
                             direction=pending_action,
                             order_type='MARKET',
-                            price=fill_price,
+                            price=exec_price,
                             timestamp=row.Index,
                             atr=atr_val,
                             adx=adx_val
@@ -245,17 +275,17 @@ class EventDrivenBacktest:
                                     symbol=asset_symbol,
                                     direction=TradeDirection.LONG if pending_action == 1 else TradeDirection.SHORT,
                                     lots=lots,
-                                    avg_entry_price=fill_price,
+                                    avg_entry_price=exec_price,
                                     multiplier=multiplier,
                                     initial_margin_per_lot=initial_margin,
                                     entry_time=row.Index
                                 )
                                 entered_this_bar_index = i
-                                self._emit_log(f"✅ [{row.Index}] PHASE I — T+1 Entry: {order_request.direction_str} x{lots} at {fill_price:.2f}")
+                                self._emit_log(f"✅ [{row.Index}] PHASE I — T+1 Entry: {order_request.direction_str} x{lots} at {exec_price:.2f}")
                                 executed_this_bar = True
                                 
-                                # Deduct entry friction (single-side cost)
-                                entry_cost = (commission + (slippage * multiplier)) * lots
+                                # Deduct entry friction (single-side cost - commission only)
+                                entry_cost = commission * lots
                                 current_balance -= entry_cost
                         else:
                             # Legacy fallback (no validate_order)
@@ -265,17 +295,17 @@ class EventDrivenBacktest:
                                     symbol=asset_symbol,
                                     direction=TradeDirection.LONG if pending_action == 1 else TradeDirection.SHORT,
                                     lots=lots,
-                                    avg_entry_price=fill_price,
+                                    avg_entry_price=exec_price,
                                     multiplier=multiplier,
                                     initial_margin_per_lot=initial_margin,
                                     entry_time=row.Index
                                 )
                                 entered_this_bar_index = i
-                                self._emit_log(f"✅ [{row.Index}] PHASE I — T+1 Entry (Legacy): {pending_action} x{lots} at {fill_price:.2f}")
+                                self._emit_log(f"✅ [{row.Index}] PHASE I — T+1 Entry (Legacy): {pending_action} x{lots} at {exec_price:.2f}")
                                 executed_this_bar = True
                                 
-                                # Deduct entry friction (single-side cost)
-                                entry_cost = (commission + (slippage * multiplier)) * lots
+                                # Deduct entry friction (single-side cost - commission only)
+                                entry_cost = commission * lots
                                 current_balance -= entry_cost
                 
                 # Step I-2: Destroy the pending order object — it is now consumed
@@ -317,27 +347,37 @@ class EventDrivenBacktest:
                 dir_val = current_position.direction.value
                 direction_mult = 1 if dir_val == "LONG" or dir_val == 1 else -1
                 
-                # Liquidation executed at current bar's close price (Margin Call Market Order)
-                pnl_gross = (row.close - current_position.avg_entry_price) * direction_mult * multiplier * lots_closed
-                cost_val = (commission + (slippage * multiplier)) * lots_closed
-                pnl_net = pnl_gross - 2 * cost_val
+                # Apply exit slippage and discretization for Margin Call close out
+                fill_price = row.close
+                if direction_mult == 1:  # Selling: Floor
+                    exit_price = math.floor((fill_price - slippage) / tick_size) * tick_size
+                else:  # Buying: Ceil
+                    exit_price = math.ceil((fill_price + slippage) / tick_size) * tick_size
+                    
+                pnl_gross = (exit_price - current_position.avg_entry_price) * direction_mult * multiplier * lots_closed
+                exit_cost = commission * lots_closed
+                pnl_net = pnl_gross - 2 * commission * lots_closed
                 
                 trades_list.append({
                     'entry_time': current_position.entry_time,
                     'exit_time': row.Index,
                     'entry_price': current_position.avg_entry_price,
-                    'exit_price': row.close,
+                    'exit_price': exit_price,
                     'direction': current_position.direction.value,
                     'lots': current_position.lots,
                     'net_pnl': pnl_net,
-                    'exit_reason': "Margin_Call"
+                    'exit_reason': "Margin_Call",
+                    'requested_price': fill_price,
+                    'commission_paid': 2 * commission * lots_closed,
+                    'slippage_incurred': 2 * slippage * multiplier * lots_closed,
+                    'margin_occupied': lots_closed * initial_margin
                 })
                 
-                current_balance += pnl_gross - cost_val
+                current_balance += pnl_gross - exit_cost
                 current_position = None
                 just_closed = True
                 
-                self._emit_log(f"🚨 [{row.Index}] PHASE II — MARGIN CALL LIQUIDATION at {row.close:.2f} | Net PnL={pnl_net:.2f}")
+                self._emit_log(f"🚨 [{row.Index}] PHASE II — MARGIN CALL LIQUIDATION at {exit_price:.2f} | Net PnL={pnl_net:.2f}")
                 
                 # Record state and skip to next bar
                 equity_curve[i] = current_balance
@@ -386,28 +426,40 @@ class EventDrivenBacktest:
                         lots_closed = current_position.lots
                         dir_val = current_position.direction.value
                         direction_mult = 1 if dir_val == "LONG" or dir_val == 1 else -1
-                        pnl_gross = (stop_exit_price - current_position.avg_entry_price) * direction_mult * multiplier * lots_closed
-                        cost_val = (commission + (slippage * multiplier)) * lots_closed
-                        pnl_net = pnl_gross - 2 * cost_val
+                        
+                        actual_exit_slippage = 0.0 if "TP" in str(reason) else slippage
+                        
+                        if direction_mult == 1:  # Selling: Floor
+                            exit_price = math.floor((stop_exit_price - actual_exit_slippage) / tick_size) * tick_size
+                        else:  # Buying: Ceil
+                            exit_price = math.ceil((stop_exit_price + actual_exit_slippage) / tick_size) * tick_size
+                            
+                        pnl_gross = (exit_price - current_position.avg_entry_price) * direction_mult * multiplier * lots_closed
+                        exit_cost = commission * lots_closed
+                        pnl_net = pnl_gross - 2 * commission * lots_closed
                         
                         # GUARD: append strictly inside this risk-intervention block
                         trades_list.append({
                             'entry_time': current_position.entry_time,
                             'exit_time': row.Index,
                             'entry_price': current_position.avg_entry_price,
-                            'exit_price': stop_exit_price,
+                            'exit_price': exit_price,
                             'direction': current_position.direction.value,
                             'lots': current_position.lots,
                             'net_pnl': pnl_net,
-                            'exit_reason': reason
+                            'exit_reason': reason,
+                            'requested_price': stop_exit_price,
+                            'commission_paid': 2 * commission * lots_closed,
+                            'slippage_incurred': 2 * actual_exit_slippage * multiplier * lots_closed,
+                            'margin_occupied': lots_closed * initial_margin
                         })
                         
-                        current_balance += pnl_gross - cost_val
+                        current_balance += pnl_gross - exit_cost
                         current_position = None
                         just_closed = True
                         is_intra_closed = True
-                        self._emit_log(f"⚠️ [{row.Index}] PHASE II — {reason} at {stop_exit_price:.2f} | Net PnL={pnl_net:.2f}")
-
+                        self._emit_log(f"⚠️ [{row.Index}] PHASE II — {reason} at {exit_price:.2f} | Net PnL={pnl_net:.2f}")
+ 
             if is_intra_closed:
                 # Record state and skip to next bar — signal detection is skipped
                 equity_curve[i] = current_balance
@@ -430,13 +482,20 @@ class EventDrivenBacktest:
                     force_exit_reason = "Force_Close_Lunch"
             
             if force_exit_reason and current_position is not None and current_position.lots > 0:
-                exit_price = row.close
+                fill_price = row.close
                 lots_closed = current_position.lots
                 dir_val = current_position.direction.value
                 direction_mult = 1 if dir_val == "LONG" or dir_val == 1 else -1
+                
+                # Apply exit slippage and discretization
+                if direction_mult == 1:  # Selling: Floor
+                    exit_price = math.floor((fill_price - slippage) / tick_size) * tick_size
+                else:  # Buying: Ceil
+                    exit_price = math.ceil((fill_price + slippage) / tick_size) * tick_size
+                    
                 pnl_gross = (exit_price - current_position.avg_entry_price) * direction_mult * multiplier * lots_closed
-                cost_val = (commission + (slippage * multiplier)) * lots_closed
-                pnl_net = pnl_gross - 2 * cost_val
+                exit_cost = commission * lots_closed
+                pnl_net = pnl_gross - 2 * commission * lots_closed
                 
                 trades_list.append({
                     'entry_time': current_position.entry_time,
@@ -446,10 +505,14 @@ class EventDrivenBacktest:
                     'direction': current_position.direction.value,
                     'lots': current_position.lots,
                     'net_pnl': pnl_net,
-                    'exit_reason': force_exit_reason
+                    'exit_reason': force_exit_reason,
+                    'requested_price': fill_price,
+                    'commission_paid': 2 * commission * lots_closed,
+                    'slippage_incurred': 2 * slippage * multiplier * lots_closed,
+                    'margin_occupied': lots_closed * initial_margin
                 })
                 
-                current_balance += pnl_gross - cost_val
+                current_balance += pnl_gross - exit_cost
                 current_position = None
                 just_closed = True
                 
@@ -519,26 +582,37 @@ class EventDrivenBacktest:
         # === END-OF-DATA: Force close any remaining open position ===
         if current_position is not None and current_position.lots > 0:
             last_row = df.iloc[-1]
-            exit_price = last_row['close']
+            fill_price = last_row['close']
             lots_closed = current_position.lots
             dir_val = current_position.direction.value
             direction_mult = 1 if dir_val == "LONG" or dir_val == 1 else -1
+            
+            # Apply exit slippage and discretization
+            if direction_mult == 1:  # Selling: Floor
+                exit_price = math.floor((fill_price - slippage) / tick_size) * tick_size
+            else:  # Buying: Ceil
+                exit_price = math.ceil((fill_price + slippage) / tick_size) * tick_size
+                
             pnl_gross = (exit_price - current_position.avg_entry_price) * direction_mult * multiplier * lots_closed
-            cost_val = (commission + (slippage * multiplier)) * lots_closed
-            pnl_net = pnl_gross - 2 * cost_val
+            exit_cost = commission * lots_closed
+            pnl_net = pnl_gross - 2 * commission * lots_closed
             
             trades_list.append({
                 'entry_time': current_position.entry_time,
                 'exit_time': last_row.name,
-                'entry_price': current_position.avg_entry_price,  # FIX: was .avg_price
+                'entry_price': current_position.avg_entry_price,
                 'exit_price': exit_price,
                 'direction': current_position.direction.value,
                 'lots': current_position.lots,
                 'net_pnl': pnl_net,
-                'exit_reason': "End_Of_Data"
+                'exit_reason': "End_Of_Data",
+                'requested_price': fill_price,
+                'commission_paid': 2 * commission * lots_closed,
+                'slippage_incurred': 2 * slippage * multiplier * lots_closed,
+                'margin_occupied': lots_closed * initial_margin
             })
             
-            current_balance += pnl_gross - cost_val
+            current_balance += pnl_gross - exit_cost
             current_equity = current_balance
             net_pnl_arr[-1] = pnl_net
         
