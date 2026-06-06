@@ -517,3 +517,177 @@ def test_adx_filter_holds_active_positions():
     assert signals.iloc[0] == 1, f"Expected signal 1 on day 1, got {signals.iloc[0]}"
     assert signals.iloc[1] == 1, f"Expected signal 1 on day 2 (hold allowed), got {signals.iloc[1]}"
     assert signals.iloc[2] == 0, f"Expected signal 0 on day 3 (reversal blocked), got {signals.iloc[2]}"
+
+
+def test_risk_worker_custom_signal_logic_execution():
+    """
+    Verify that RiskWorker correctly extracts and passes the signal_logic_code
+    to DirectSignalGenerator when strategy is 'Direct Signal', and does not
+    throw TypeError.
+    """
+    from ui.tabs.risk_tab import RiskWorker
+    import json
+    from unittest.mock import mock_open
+    
+    # 1. Prepare raw DNA (Unified StrategyConfig format) and mock DataFrame
+    raw_dna = {
+        "metadata": {
+            "strategy_id": "TEST_STG",
+            "created_at": "2026-06-06"
+        },
+        "environment_config": {
+            "universe": "TEST_UNIV",
+            "timeframe": "1D"
+        },
+        "alpha_pipeline": {
+            "expression": "Direct Signal"
+        },
+        "identification": {"strategy_id": "TEST_STG"},
+        # 必须补充真实的生产级别配置路径！
+        "backtest_profile": {
+            "settings": {
+                "strategy": "Direct Signal",
+                "initial_capital": 100000.0,
+                "upper_bound": 0.5,
+                "lower_bound": -0.5,
+                "execution_mode": "Close",
+                "multiplier": 1.0,
+                "commission": 0.0,
+                "slippage": 0.0,
+                "initial_margin": 1000.0,
+                "allow_overnight": True,
+                "allow_lunch": True,
+                "use_adx_filter": False,
+                "max_lots": 2,
+                "sl_pct": 0.0,
+                "tp_pct": 0.0,
+                "signal_logic_code": "df['signal'] = 1"
+            }
+        },
+        "optimized_decision_parameters": {
+            "entry_threshold": 0.5,
+            "exit_threshold": -0.5,
+            "signal_logic_code": "df['signal'] = 1"
+        }
+    }
+    
+    dates = pd.date_range("2026-01-01", periods=5)
+    mock_df = pd.DataFrame({
+        'open': [100.0] * 5,
+        'high': [101.0] * 5,
+        'low': [99.0] * 5,
+        'close': [100.0] * 5,
+        'factor': [0.0] * 5
+    }, index=dates)
+    
+    # 2. Mock read_parquet and open
+    with patch('pandas.read_parquet', return_value=mock_df), \
+         patch('builtins.open', mock_open(read_data=json.dumps(raw_dna))), \
+         patch('src.core.ast_validator.verify_expression_safety') as mock_verify:
+        
+        worker = RiskWorker(dna_path="mock_dna.json", signal_path="mock_signals.parquet")
+        
+        # We patch finished.emit to verify output results
+        worker.finished = MagicMock()
+        worker.error = MagicMock()
+        
+        # Run worker synchronously
+        worker.run()
+        
+        # Verify no error was raised and finished was called
+        assert not worker.error.emit.called, f"RiskWorker failed with error: {worker.error.emit.call_args}"
+        assert worker.finished.emit.called, "RiskWorker.run did not finish successfully."
+        
+        # Verify result contains base and original tracks
+        results = worker.finished.emit.call_args[0][0]
+        assert 'base' in results
+        assert 'original' in results
+        
+        # Verify signals in original track are generated using custom rule code (signal = 1 everywhere)
+        orig_signals = results['original']['signals']
+        assert (orig_signals == 1).all()
+
+
+def test_risk_worker_legacy_generator_compatibility():
+    """
+    Verify that non-Direct Signal strategies (e.g. Mean Reversion) do NOT 
+    receive the 'signal_logic_code' kwarg, preventing a fatal TypeError.
+    """
+    from ui.tabs.risk_tab import RiskWorker
+    import json
+    from unittest.mock import mock_open, patch, MagicMock
+    import pandas as pd
+
+    # 模拟一个普通的均值回归策略，但 JSON 里残留了历史代码字段
+    raw_dna = {
+        "backtest_profile": {"settings": {"strategy": "Mean Reversion"}},
+        "optimized_decision_parameters": {
+            "signal_logic_code": "df['signal'] = 1" # 残留字段
+        }
+    }
+    dates = pd.date_range("2026-01-01", periods=5)
+    mock_df = pd.DataFrame({'open': [100.0]*5, 'high': [101.0]*5, 'low': [99.0]*5, 'close': [100.0]*5, 'factor': [0.0]*5}, index=dates)
+
+    with patch('pandas.read_parquet', return_value=mock_df), \
+         patch('builtins.open', mock_open(read_data=json.dumps(raw_dna))):
+
+        worker = RiskWorker(dna_path="mock.json", signal_path="mock.parquet")
+        worker.error = MagicMock()
+        worker.finished = MagicMock()
+
+        worker.run()
+
+        # 必须断言没有抛出异常！如果参数传递错误，这里会捕捉到 TypeError
+        assert not worker.error.emit.called, f"Fatal Crash! TypeError was not prevented: {worker.error.emit.call_args}"
+        assert worker.finished.emit.called, "Worker failed to finish."
+
+
+@patch('PyQt6.QtWidgets.QFileDialog.getSaveFileName')
+@patch('PyQt6.QtWidgets.QMessageBox.information')
+def test_export_complete_report_html_escaping(mock_msg, mock_file_dialog):
+    """
+    Verify that custom Python logic code containing HTML-sensitive characters
+    (<, >, &, etc.) is properly escaped to prevent DOM breakage.
+    """
+    from ui.tabs.risk_tab import RiskTab
+    from unittest.mock import mock_open
+    
+    mock_file_dialog.return_value = ("mock_report.html", "HTML Files (*.html)")
+    
+    with patch('PyQt6.QtWidgets.QWidget'):
+        tab = RiskTab.__new__(RiskTab)
+        tab.folder_combo = MagicMock()
+        tab.folder_combo.currentText.return_value = "TEST_FOLDER"
+        
+        tab._current_config = {
+            "metadata": {
+                "strategy_id": "TEST_STG",
+                "strategy_name": "TEST_NAME",
+                "status": "BACKTESTED"
+            },
+            "alpha_pipeline": {
+                "expression": "Direct Signal"
+            },
+            "backtest_profile": {
+                "settings": {
+                    "strategy": "Direct Signal",
+                    "signal_logic_code": "df['signal'] = np.where(df['close'].shift(-1) > df['close'], 1, 0)"
+                }
+            }
+        }
+        tab.current_results = {
+            "base": {"metrics": {}},
+            "original": {"metrics": {}, "audit_log": []}
+        }
+        
+        with patch('builtins.open', mock_open()) as mock_file:
+            tab._export_complete_report()
+            
+            written_content = "".join([call.args[0] for call in mock_file().write.call_args_list])
+            
+            # Assert raw dangerous ">" does not appear as raw code context
+            assert "shift(-1) > df['close']" not in written_content, "CRITICAL: HTML was not escaped! DOM breakage risk."
+            
+            # Assert escaped entity exists instead
+            assert "shift(-1) &gt; df[&#x27;close&#x27;]" in written_content or "shift(-1) &gt; df['close']" in written_content, \
+                "Escaped HTML entities missing in the generated report."

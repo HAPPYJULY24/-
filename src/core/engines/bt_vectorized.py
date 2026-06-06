@@ -263,7 +263,9 @@ class VectorizedBacktest:
             
             lots = risk_amount / contract_size
             lots = lots.fillna(0).astype(int)
-            lots = lots.clip(upper=max_lots)
+            # Align with RiskManager: clamp to minimum of 1 lot if contract_size is valid and finite
+            lots_clamped = np.where((contract_size > 0) & (contract_size < np.inf), np.maximum(lots, 1), lots)
+            lots = pd.Series(lots_clamped, index=df.index).clip(upper=max_lots)
             
             df['pos_raw'] = df['signal'] * lots
         else:

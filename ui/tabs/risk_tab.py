@@ -82,7 +82,8 @@ class RiskWorker(QThread):
                         "exit_threshold": float(settings.get("lower_bound", 0.0)),
                         "rebalance_mode": "signal_driven",
                         "order_type": "market",
-                        "execution_mode": settings.get("execution_mode", "Close")
+                        "execution_mode": settings.get("execution_mode", "Close"),
+                        "signal_logic_code": settings.get("signal_logic_code", "")
                     },
                     "execution_constraints": {
                         "allow_overnight": bool(settings.get("allow_overnight", True)),
@@ -124,9 +125,18 @@ class RiskWorker(QThread):
             strategy_type = "Mean Reversion" # 默认安全底线
             if "backtest_profile" in raw_dna and "settings" in raw_dna["backtest_profile"]:
                 strategy_type = raw_dna["backtest_profile"]["settings"].get("strategy", "Mean Reversion")
+            elif "alpha_configuration" in raw_dna:
+                strategy_type = raw_dna["alpha_configuration"].get("factor_expression", "Mean Reversion")
 
-            df['signal'] = SignalFactory.create(strategy_type).generate(
-                df, upper_bound=upper_bound, lower_bound=lower_bound)
+            generate_kwargs = {
+                "upper_bound": upper_bound,
+                "lower_bound": lower_bound
+            }
+            signal_code = dna.get("optimized_decision_parameters", {}).get("signal_logic_code", None)
+            if strategy_type == "Direct Signal" and signal_code:
+                generate_kwargs["signal_logic_code"] = signal_code
+
+            df['signal'] = SignalFactory.create(strategy_type).generate(df, **generate_kwargs)
 
             # Read max_position_size from DNA so BASE track uses the same lot cap
             max_lots = int(dna["backtest_risk_settings"].get("max_position_size", 20))
@@ -609,7 +619,8 @@ class RiskTab(QWidget):
                         "exit_threshold": float(settings.get("lower_bound", 0.0)),
                         "rebalance_mode": "signal_driven",
                         "order_type": "market",
-                        "execution_mode": settings.get("execution_mode", "Close")
+                        "execution_mode": settings.get("execution_mode", "Close"),
+                        "signal_logic_code": settings.get("signal_logic_code", "")
                     },
                     "execution_constraints": {
                         "allow_overnight": bool(settings.get("allow_overnight", True)),
@@ -687,7 +698,8 @@ class RiskTab(QWidget):
                             "sl_pct": float(brs.get("stop_loss_value", 0.0)),
                             "tp_pct": float(brs.get("take_profit_value", 0.0)),
                             "use_adx_filter": bool(ec.get("adx_filter_enabled", False)),
-                            "max_lots": int(brs.get("max_position_size", 20))
+                            "max_lots": int(brs.get("max_position_size", 20)),
+                            "signal_logic_code": op.get("signal_logic_code", "")
                         },
                         "metrics": {}
                     },
@@ -723,6 +735,14 @@ class RiskTab(QWidget):
                 "─" * 35,
                 f"Capital:       {env.get('initial_capital', 0):,.0f}",
             ]
+            signal_logic_code = op.get("signal_logic_code", "")
+            if signal_logic_code:
+                flat_code = signal_logic_code.replace('\n', ' ').strip()
+                display_code = (flat_code[:100] + "...") if len(flat_code) > 100 else flat_code
+                lines.extend([
+                    "─" * 35,
+                    f"Rule Code:     {display_code}"
+                ])
             self.dna_summary.setText("\n".join(lines))
 
             # ── Pre-fill playground with original DNA values ───
@@ -1047,6 +1067,16 @@ class RiskTab(QWidget):
             # ── 2. Gather Backtest Stage info ──────────────────
             backtest_profile = config.get("backtest_profile", {})
             bt_settings = backtest_profile.get("settings", {}) or {}
+            
+            import html
+            signal_logic_code = bt_settings.get("signal_logic_code", "")
+            safe_code = html.escape(signal_logic_code) if signal_logic_code else ""
+            code_block_html = ""
+            if safe_code:
+                code_block_html = f"""
+                    <li><strong>自定义信号规则代码:</strong></li>
+                    <div class="code-block" style="color: #a5d6a7; border-color: #4CAF50;">{safe_code}</div>
+                """
             bt_metrics = backtest_profile.get("metrics", {}) or {}
             
             # ── 3. Gather Risk Sentinel Stage info ─────────────
@@ -1353,6 +1383,7 @@ class RiskTab(QWidget):
                     <li><strong>分位数剪裁:</strong> [{quantile_lb}, {quantile_ub}]</li>
                     <li><strong>行业/风险对齐:</strong> {", ".join(risk_factors) if risk_factors else "None (No Neutralization)"}</li>
                     {ridge_alpha_html}
+                    {code_block_html}
                 </div>
                 <div class="card-footer">
                     生命周期起跑点: ALPHA_DRAFT
