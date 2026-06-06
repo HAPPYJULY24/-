@@ -185,54 +185,8 @@ class AlphaEngine:
         CRITICAL-01: Verify the factor expression dynamically using AST.
         Raises ValueError if any negative shift or look-ahead patterns are detected.
         """
-        if not expression:
-            return
-        try:
-            tree = ast.parse(expression)
-        except SyntaxError as e:
-            raise ValueError(f"Expression syntax error: {str(e)}")
-
-        for node in ast.walk(tree):
-            # 1. Block shift / pct_change negative arguments
-            if isinstance(node, ast.Call):
-                func_name = getattr(node.func, 'attr', None)
-                if func_name in {'shift', 'pct_change'}:
-                    # Check positional arguments
-                    for arg in node.args:
-                        # Negative UnaryOp (e.g. -1)
-                        if isinstance(arg, ast.UnaryOp) and isinstance(arg.op, ast.USub):
-                            if isinstance(arg.operand, ast.Constant) and arg.operand.value > 0:
-                                raise ValueError(f"Look-ahead bias detected: negative argument in {func_name}() is forbidden.")
-                            elif isinstance(arg.operand, ast.Num) and arg.operand.n > 0:
-                                raise ValueError(f"Look-ahead bias detected: negative argument in {func_name}() is forbidden.")
-                        # Negative constant literals directly
-                        elif isinstance(arg, ast.Constant) and isinstance(val := getattr(arg, 'value', None), (int, float)) and val < 0:
-                            raise ValueError(f"Look-ahead bias detected: negative argument in {func_name}() is forbidden.")
-
-                    # Check keyword arguments (e.g. periods=-5)
-                    for kw in node.keywords:
-                        if kw.arg in {'periods', 'periods_y', 'periods_x'}:
-                            val_node = kw.value
-                            if isinstance(val_node, ast.UnaryOp) and isinstance(val_node.op, ast.USub):
-                                if isinstance(val_node.operand, ast.Constant) and val_node.operand.value > 0:
-                                    raise ValueError(f"Look-ahead bias detected: negative keyword argument '{kw.arg}' in {func_name}() is forbidden.")
-                                elif isinstance(val_node.operand, ast.Num) and val_node.operand.n > 0:
-                                    raise ValueError(f"Look-ahead bias detected: negative keyword argument '{kw.arg}' in {func_name}() is forbidden.")
-                            elif isinstance(val_node, ast.Constant) and isinstance(val := getattr(val_node, 'value', None), (int, float)) and val < 0:
-                                raise ValueError(f"Look-ahead bias detected: negative keyword argument '{kw.arg}' in {func_name}() is forbidden.")
-
-            # 2. Block iloc / iat / loc / at negative subscripts (e.g. iloc[-1])
-            elif isinstance(node, ast.Subscript):
-                if isinstance(node.value, ast.Attribute) and node.value.attr in {'iloc', 'iat', 'loc', 'at'}:
-                    # Walk the subscript slice to find any negative index
-                    for sub_node in ast.walk(node.slice):
-                        if isinstance(sub_node, ast.UnaryOp) and isinstance(sub_node.op, ast.USub):
-                            if isinstance(sub_node.operand, ast.Constant) and sub_node.operand.value > 0:
-                                raise ValueError(f"Look-ahead bias detected: negative indexing in {node.value.attr} is forbidden.")
-                            elif isinstance(sub_node.operand, ast.Num) and sub_node.operand.n > 0:
-                                raise ValueError(f"Look-ahead bias detected: negative indexing in {node.value.attr} is forbidden.")
-                        elif isinstance(sub_node, ast.Constant) and isinstance(val := getattr(sub_node, 'value', None), (int, float)) and val < 0:
-                            raise ValueError(f"Look-ahead bias detected: negative indexing in {node.value.attr} is forbidden.")
+        from src.core.ast_validator import verify_expression_safety as validate_fn
+        validate_fn(expression)
 
     @staticmethod
     def calculate_execution_returns(df: pd.DataFrame, price_col: str, open_col: str | None = None, periods: list = [1]) -> pd.DataFrame:

@@ -26,7 +26,8 @@ class VectorizedBacktest:
             initial_margin: float, maintenance_margin_rate: float = 0.8,
             allow_lunch: bool = True, allow_overnight: bool = True,
             execution_mode: str = 'Close', risk_target: float = 0.02, sl_pct: float = 0.0,
-            max_lots: int = 20, pressure_test: bool = False, use_adx_filter: bool = False) -> Dict:
+            max_lots: int = 20, pressure_test: bool = False, use_adx_filter: bool = False,
+            custom_signals: Optional[pd.Series] = None) -> Dict:
         """
         Execute vectorized backtest.
 
@@ -98,18 +99,21 @@ class VectorizedBacktest:
         df['atr'] = df['atr'].shift(1).fillna(0)
         
         # 3. Generate Signals
-        if 'signal' not in df.columns:
-            df['signal'] = 0
-        df['signal'] = df['signal'].fillna(0).astype(int)
-        
-        # Apply ADX Filter if enabled (Bug 5 - only blocks new entries and reversals)
-        if use_adx_filter:
-            prev_sig = df['signal'].shift(1).fillna(0).astype(int)
-            is_new_entry = (df['signal'] != 0) & (df['signal'] != prev_sig)
-            df['signal'] = np.where(is_new_entry & (df['adx'] < 20), 0, df['signal'])
-        
-        # 4. Apply Trading Hours Filter
-        df = self._filter_trading_hours(df, allow_lunch, allow_overnight)
+        if custom_signals is not None:
+            df['signal'] = custom_signals.fillna(0).astype(int)
+        else:
+            if 'signal' not in df.columns:
+                df['signal'] = 0
+            df['signal'] = df['signal'].fillna(0).astype(int)
+            
+            # Apply ADX Filter if enabled (Bug 5 - only blocks new entries and reversals)
+            if use_adx_filter:
+                prev_sig = df['signal'].shift(1).fillna(0).astype(int)
+                is_new_entry = (df['signal'] != 0) & (df['signal'] != prev_sig)
+                df['signal'] = np.where(is_new_entry & (df['adx'] < 20), 0, df['signal'])
+            
+            # 4. Apply Trading Hours Filter
+            df = self._filter_trading_hours(df, allow_lunch, allow_overnight)
         
         # 5. Position Sizing
         df = self._calculate_position_size(df, risk_target, initial_capital, multiplier, max_lots)

@@ -96,6 +96,9 @@ class DirectSignalGenerator(BaseSignalGenerator):
             )
             return signals
 
+        from src.core.ast_validator import verify_expression_safety
+        verify_expression_safety(signal_code)
+
         # 1. Copy and Pre-initialize 'signal' column
         df_copy = df.copy()
         df_copy['signal'] = 0.0

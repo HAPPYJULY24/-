@@ -97,8 +97,8 @@ class BacktestEngine:
     
     def audit_lookahead(self, df: pd.DataFrame, params: dict) -> Dict:
         """
-        Audit for lookahead bias by shifting factor by 1 bar and comparing PnL.
-        If profit collapses when shifted, signal is likely using future data.
+        Audit for lookahead bias by shifting generated signals by 1 bar and comparing PnL.
+        If profit collapses when signals are shifted, signal is likely using future data.
         
         Args:
             df: DataFrame with OHLCV and factor
@@ -109,18 +109,21 @@ class BacktestEngine:
         """
         # 1. Base Run (Original)
         # Using vectorized backtest here to keep audit fast, as it runs multiple times.
-        def _quick_run(data: pd.DataFrame):
+        def _quick_run(data: pd.DataFrame, custom_signals: Optional[pd.Series] = None):
             # Pipeline preprocessing
             strategy = params.get('strategy', 'Mean Reversion')
             generator = SignalFactory.create(strategy)
             
-            # The signal must be generated FRESH over the given 'data'
-            data['signal'] = generator.generate(
-                data, 
-                upper_bound=params.get('upper_bound', 0.5), 
-                lower_bound=params.get('lower_bound', -0.5),
-                signal_logic_code=params.get('signal_logic_code')
-            )
+            # The signal must be generated FRESH over the given 'data' if custom_signals is not provided
+            if custom_signals is not None:
+                data['signal'] = custom_signals
+            else:
+                data['signal'] = generator.generate(
+                    data, 
+                    upper_bound=params.get('upper_bound', 0.5), 
+                    lower_bound=params.get('lower_bound', -0.5),
+                    signal_logic_code=params.get('signal_logic_code')
+                )
             
             return self.vectorized.run(
                 df=data,
@@ -137,18 +140,20 @@ class BacktestEngine:
                 sl_pct=params.get('sl_pct', 0.0),
                 max_lots=params.get('max_lots', 20),
                 pressure_test=True,  # Audit uses vectorized as a fast sub-routine
-                use_adx_filter=params.get('use_adx_filter', False)
+                use_adx_filter=params.get('use_adx_filter', False),
+                custom_signals=custom_signals
             )
             
         base_res = _quick_run(df.copy())
         base_profit = base_res['metrics']['Total Net Profit']
+        base_signals = base_res['signals']
         
-        # 2. Audited Run (Shift Factor +1)
-        # Shift factor means signal t+1 is now based on factor t
+        # 2. Audited Run (Shift Signals +1)
+        # Shift signals means signal t+1 is now executed at time t+1 (delayed by 1 bar)
         df_audit = df.copy()
-        df_audit['factor'] = df_audit['factor'].shift(1)
+        audited_signals = base_signals.shift(1).fillna(0).astype(int)
         
-        audit_res = _quick_run(df_audit)
+        audit_res = _quick_run(df_audit, custom_signals=audited_signals)
         audit_profit = audit_res['metrics']['Total Net Profit']
         
         # 3. Compare Results
@@ -157,7 +162,8 @@ class BacktestEngine:
             diff_pct = (base_profit - audit_profit) / abs(base_profit)
         
         # Set warning if profit drops by more than 50%
-        warning = (diff_pct > 0.5) and (base_profit > 100) # Only warn for profitable cases
+        total_trades = base_res['metrics'].get('Total Trades', 0)
+        warning = (diff_pct > 0.5) and (base_profit > 10.0) and (total_trades > 2)
         
         return {
             'warning': warning,
